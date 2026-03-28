@@ -1,0 +1,4 @@
+[console_scripts]
+vrm-api = vrm_solar_automation.api:main
+vrm-probe = vrm_solar_automation.cli:main
+vrm-pump-policy = vrm_solar_automation.cli:main

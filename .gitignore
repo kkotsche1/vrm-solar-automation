@@ -1,0 +1,11 @@
+.env
+.pytest_cache/
+.venv/
+.state/
+__pycache__/
+*.pyc
+dist/
+build/
+frontend/node_modules/
+frontend/dist/
+frontend/.npm-cache/
