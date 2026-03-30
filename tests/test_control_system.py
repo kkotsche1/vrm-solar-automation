@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 from vrm_solar_automation.config import Settings
 from vrm_solar_automation.models import PowerSnapshot
-from vrm_solar_automation.policy import PumpPolicy, PumpPolicyConfig, PumpPolicyState
+from vrm_solar_automation.policy import PumpPolicy, PumpPolicyState
 from vrm_solar_automation.shelly import ShellySwitchCommandResult, ShellySwitchStatus
 from vrm_solar_automation.system import PumpControlSystem
 from vrm_solar_automation.weather import WeatherSnapshot
@@ -99,7 +99,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.action, "turn_off")
         self.assertIn("Generator power is present", decision.reason)
 
-    def test_weather_unknown_falls_back_to_power_logic(self) -> None:
+    def test_weather_unknown_keeps_operation_off(self) -> None:
         policy = PumpPolicy()
         decision = policy.decide(
             power=_build_power_snapshot(generator_watts=0.0),
@@ -114,9 +114,126 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             now=datetime(2026, 1, 10, tzinfo=UTC),
         )
 
-        self.assertTrue(decision.should_turn_on)
+        self.assertFalse(decision.should_turn_on)
         self.assertEqual(decision.weather_mode, "unknown")
-        self.assertIn("Weather data is unavailable", decision.reason)
+        self.assertIn("automatic control stays off", decision.reason)
+
+    def test_battery_soc_at_or_below_reserve_turns_off(self) -> None:
+        policy = PumpPolicy()
+        decision = policy.decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=50.0),
+            weather=_build_heating_weather(),
+            previous_state=None,
+            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertEqual(decision.action, "turn_off")
+        self.assertIn("50.0% reserve", decision.reason)
+
+    def test_battery_soc_above_run_threshold_turns_on_with_demand(self) -> None:
+        policy = PumpPolicy()
+        decision = policy.decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0),
+            weather=_build_heating_weather(),
+            previous_state=None,
+            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(decision.action, "turn_on")
+        self.assertIn("60.0% run threshold", decision.reason)
+
+    def test_hysteresis_band_keeps_previous_on_state(self) -> None:
+        policy = PumpPolicy()
+        previous_state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        decision = policy.decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=55.0),
+            weather=_build_heating_weather(),
+            previous_state=previous_state,
+            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(decision.action, "keep_on")
+        self.assertIn("previous automatic state stays on", decision.reason)
+
+    def test_hysteresis_band_keeps_previous_off_state(self) -> None:
+        policy = PumpPolicy()
+        previous_state = PumpPolicyState(
+            is_on=False,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        decision = policy.decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=55.0),
+            weather=_build_heating_weather(),
+            previous_state=previous_state,
+            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertEqual(decision.action, "keep_off")
+        self.assertIn("previous automatic state stays off", decision.reason)
+
+    def test_hysteresis_band_defaults_to_off_without_previous_state(self) -> None:
+        policy = PumpPolicy()
+        decision = policy.decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=55.0),
+            weather=_build_heating_weather(),
+            previous_state=None,
+            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertEqual(decision.action, "turn_off")
+        self.assertIn("no previous automatic state", decision.reason)
+
+    def test_weather_classifies_heating_from_daily_low(self) -> None:
+        decision = PumpPolicy().decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0),
+            weather=_build_weather(today_min_temperature_c=12.0, today_max_temperature_c=20.0),
+            previous_state=None,
+            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertEqual(decision.weather_mode, "heating")
+        self.assertTrue(decision.should_turn_on)
+
+    def test_weather_classifies_cooling_from_daily_high(self) -> None:
+        decision = PumpPolicy().decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0),
+            weather=_build_weather(today_min_temperature_c=18.0, today_max_temperature_c=26.0),
+            previous_state=None,
+            now=datetime(2026, 7, 10, tzinfo=UTC),
+        )
+
+        self.assertEqual(decision.weather_mode, "cooling")
+        self.assertTrue(decision.should_turn_on)
+
+    def test_weather_classifies_mixed_when_forecast_spans_both_edges(self) -> None:
+        decision = PumpPolicy().decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0),
+            weather=_build_weather(today_min_temperature_c=10.0, today_max_temperature_c=28.0),
+            previous_state=None,
+            now=datetime(2026, 4, 10, tzinfo=UTC),
+        )
+
+        self.assertEqual(decision.weather_mode, "mixed")
+        self.assertTrue(decision.should_turn_on)
+
+    def test_weather_classifies_mild_inside_comfort_band(self) -> None:
+        decision = PumpPolicy().decide(
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0),
+            weather=_build_weather(today_min_temperature_c=14.0, today_max_temperature_c=24.0),
+            previous_state=None,
+            now=datetime(2026, 4, 10, tzinfo=UTC),
+        )
+
+        self.assertEqual(decision.weather_mode, "mild")
+        self.assertFalse(decision.should_turn_on)
 
     async def test_control_reconciles_shelly_to_intended_state(self) -> None:
         state_store = FakeStateStore()
@@ -221,10 +338,10 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         )
         system = PumpControlSystem(
             Settings(state_file=".state/test-state.json"),
-            policy=PumpPolicy(PumpPolicyConfig(minimum_state_hold_minutes=0)),
+            policy=PumpPolicy(),
             probe_client=FakeProbeClient(
                 [
-                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=52.0),
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=50.0),
                     _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
                 ]
             ),
@@ -249,7 +366,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         state_store = FakeStateStore()
         system = PumpControlSystem(
             Settings(state_file=".state/test-state.json"),
-            policy=PumpPolicy(PumpPolicyConfig(minimum_state_hold_minutes=0)),
+            policy=PumpPolicy(),
             probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0)),
             weather_client=FakeWeatherClient(_build_heating_weather()),
             plug_client=FakePlugClient(status_outputs=[True, False, False, False, False]),
@@ -286,10 +403,23 @@ def _build_power_snapshot(
 
 
 def _build_heating_weather() -> WeatherSnapshot:
-    return WeatherSnapshot(
+    return _build_weather(
         current_temperature_c=9.0,
         today_min_temperature_c=7.0,
         today_max_temperature_c=15.0,
+    )
+
+
+def _build_weather(
+    *,
+    current_temperature_c: float | None = 9.0,
+    today_min_temperature_c: float | None,
+    today_max_temperature_c: float | None,
+) -> WeatherSnapshot:
+    return WeatherSnapshot(
+        current_temperature_c=current_temperature_c,
+        today_min_temperature_c=today_min_temperature_c,
+        today_max_temperature_c=today_max_temperature_c,
         weather_code=3,
         queried_timezone="Europe/Madrid",
     )

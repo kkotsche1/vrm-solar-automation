@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 
 from .models import PowerSnapshot
 from .weather import WeatherSnapshot
@@ -9,18 +9,11 @@ from .weather import WeatherSnapshot
 
 @dataclass(frozen=True)
 class PumpPolicyConfig:
-    battery_off_below_soc: float = 55.0
-    battery_resume_above_soc: float = 72.0
-    solar_assist_min_watts: float = 2500.0
-    solar_assist_battery_floor_soc: float = 65.0
+    battery_off_below_soc: float = 50.0
+    battery_resume_above_soc: float = 60.0
     generator_on_block_watts: float = 100.0
-    mild_day_min_c: float = 12.0
-    mild_day_max_c: float = 26.0
-    heating_day_max_c: float = 17.0
-    cooling_day_min_c: float = 27.0
-    preferred_heating_months: tuple[int, ...] = (11, 12, 1, 2, 3)
-    preferred_cooling_months: tuple[int, ...] = (6, 7, 8, 9)
-    minimum_state_hold_minutes: int = 20
+    heating_below_c: float = 12.0
+    cooling_above_c: float = 26.0
 
 
 @dataclass(frozen=True)
@@ -91,11 +84,9 @@ class PumpPolicy:
         previous_state: PumpPolicyState | None,
         now: datetime | None = None,
     ) -> PumpDecision:
-        now = now or datetime.now(UTC)
-        reasons: list[str] = []
-        weather_mode = self._classify_weather(weather, now)
+        del now
+        weather_mode = self._classify_weather(weather)
         battery_soc = power.battery_soc_percent
-        solar_watts = power.solar_watts or 0.0
         generator_watts = abs(power.generator_watts or 0.0)
 
         if battery_soc is None:
@@ -108,105 +99,100 @@ class PumpPolicy:
             )
 
         if generator_watts >= self._config.generator_on_block_watts:
-            reasons.append(
-                f"Generator power is present at {generator_watts:.0f} W, so the pump should stay off."
-            )
-            return self._finalize(False, previous_state, reasons, weather_mode, now, bypass_hold=True)
-
-        if weather_mode == "unknown":
-            reasons.append(
-                "Weather data is unavailable, so the policy is falling back to battery, solar, and generator conditions."
+            return self._decision(
+                target_on=False,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                reason=(
+                    f"Generator power is present at {generator_watts:.0f} W, so the pump should stay off."
+                ),
             )
 
         if battery_soc <= self._config.battery_off_below_soc:
-            reasons.append(
-                f"Battery SOC is low at {battery_soc:.1f}%, below the off threshold of {self._config.battery_off_below_soc:.1f}%."
+            return self._decision(
+                target_on=False,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                reason=(
+                    f"Battery SOC is {battery_soc:.1f}%, at or below the {self._config.battery_off_below_soc:.1f}% reserve, so the pump should stay off."
+                ),
             )
-            return self._finalize(False, previous_state, reasons, weather_mode, now, bypass_hold=True)
+
+        if weather_mode == "unknown":
+            return self._decision(
+                target_on=False,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                reason="Forecast min/max temperatures are unavailable, so automatic control stays off.",
+            )
 
         if weather_mode == "mild":
-            reasons.append("Outdoor temperatures are in the mild range, so heating or cooling is not needed.")
-            return self._finalize(False, previous_state, reasons, weather_mode, now)
-
-        if previous_state and previous_state.is_on:
-            if battery_soc >= self._config.battery_off_below_soc:
-                reasons.append(
-                    f"Pump was already on, weather still calls for {weather_mode}, and battery SOC remains above the shutdown threshold at {battery_soc:.1f}%."
-                )
-                return self._finalize(True, previous_state, reasons, weather_mode, now)
+            return self._decision(
+                target_on=False,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                reason="Today's forecast stays inside the comfort band, so automatic demand is off.",
+            )
 
         if battery_soc >= self._config.battery_resume_above_soc:
-            reasons.append(
-                f"Battery SOC is healthy at {battery_soc:.1f}%, above the resume threshold of {self._config.battery_resume_above_soc:.1f}%."
+            return self._decision(
+                target_on=True,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                reason=(
+                    f"Today's forecast calls for {weather_mode}, and battery SOC is {battery_soc:.1f}%, above the {self._config.battery_resume_above_soc:.1f}% run threshold."
+                ),
             )
-            return self._finalize(True, previous_state, reasons, weather_mode, now)
 
-        if (
-            battery_soc >= self._config.solar_assist_battery_floor_soc
-            and solar_watts >= self._config.solar_assist_min_watts
-        ):
-            reasons.append(
-                f"Solar production is strong at {solar_watts:.0f} W and battery SOC is {battery_soc:.1f}%, so the pump can opportunistically run."
+        if previous_state is not None:
+            target_on = previous_state.is_on
+            state_text = "on" if target_on else "off"
+            return self._decision(
+                target_on=target_on,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                reason=(
+                    f"Today's forecast calls for {weather_mode}, and battery SOC is {battery_soc:.1f}% between the off and on thresholds, so the previous automatic state stays {state_text}."
+                ),
             )
-            return self._finalize(True, previous_state, reasons, weather_mode, now)
 
-        reasons.append(
-            "Battery and solar conditions are not strong enough to justify running the pump right now."
+        return self._decision(
+            target_on=False,
+            previous_state=previous_state,
+            weather_mode=weather_mode,
+            reason=(
+                f"Today's forecast calls for {weather_mode}, but battery SOC is {battery_soc:.1f}% and there is no previous automatic state to carry through the 50-60% hysteresis band."
+            ),
         )
-        return self._finalize(False, previous_state, reasons, weather_mode, now)
 
-    def _classify_weather(self, weather: WeatherSnapshot, now: datetime) -> str:
+    def _classify_weather(self, weather: WeatherSnapshot) -> str:
         low = weather.today_min_temperature_c
         high = weather.today_max_temperature_c
-        current = weather.current_temperature_c
-        month = now.month
         if low is None or high is None:
             return "unknown"
-        if high >= self._config.cooling_day_min_c:
-            return "cooling"
-        if high <= self._config.heating_day_max_c or low <= self._config.mild_day_min_c:
+        needs_heating = low <= self._config.heating_below_c
+        needs_cooling = high >= self._config.cooling_above_c
+        if needs_heating and needs_cooling:
+            return "mixed"
+        if needs_heating:
             return "heating"
-        if self._config.mild_day_min_c < low and high < self._config.mild_day_max_c:
-            return "mild"
-        if (
-            month in self._config.preferred_cooling_months
-            and current is not None
-            and current >= self._config.mild_day_max_c
-        ):
+        if needs_cooling:
             return "cooling"
-        if (
-            month in self._config.preferred_heating_months
-            and current is not None
-            and current <= self._config.heating_day_max_c
-        ):
-            return "heating"
-        return "mixed"
+        return "mild"
 
-    def _finalize(
+    def _decision(
         self,
+        *,
         target_on: bool,
         previous_state: PumpPolicyState | None,
-        reasons: list[str],
         weather_mode: str,
-        now: datetime,
-        *,
-        bypass_hold: bool = False,
+        reason: str,
     ) -> PumpDecision:
-        if previous_state and previous_state.is_on != target_on and not bypass_hold:
-            hold_until = previous_state.changed_at + timedelta(
-                minutes=self._config.minimum_state_hold_minutes
-            )
-            if now < hold_until:
-                reasons.append(
-                    f"Minimum hold time is active until {hold_until.isoformat()}, so the previous state is kept."
-                )
-                target_on = previous_state.is_on
-
         return PumpDecision(
             should_turn_on=target_on,
             action=self._action(target_on, previous_state),
-            reason=reasons[0],
-            reasons=reasons,
+            reason=reason,
+            reasons=[reason],
             weather_mode=weather_mode,
         )
 

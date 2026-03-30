@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 FASTAPI_AVAILABLE = importlib.util.find_spec("fastapi") is not None
@@ -11,9 +13,12 @@ HTTPX_AVAILABLE = importlib.util.find_spec("httpx") is not None
 
 if FASTAPI_AVAILABLE and HTTPX_AVAILABLE:
     from fastapi.testclient import TestClient
+    from starlette.requests import Request
+    from starlette.responses import StreamingResponse
 
     from vrm_solar_automation.api import create_app
     from vrm_solar_automation.config import Settings
+    from vrm_solar_automation.runtime import RuntimeSupport
 
 
 @unittest.skipUnless(
@@ -25,7 +30,10 @@ class ApiTests(unittest.TestCase):
         system = FakeSystem()
         app = create_app(
             env_file=".env",
-            settings_loader=lambda env_file: Settings(control_interval_seconds=30.0),
+            settings_loader=lambda env_file: Settings(
+                control_interval_seconds=30.0,
+                cerbo_mock_enabled=True,
+            ),
             system_factory=lambda settings: system,
             plug_client_factory=lambda settings: FakePlugClient(),
         )
@@ -40,7 +48,10 @@ class ApiTests(unittest.TestCase):
     def test_status_endpoint_returns_controller_payload(self) -> None:
         app = create_app(
             env_file=".env",
-            settings_loader=lambda env_file: Settings(shelly_host="plug.local"),
+            settings_loader=lambda env_file: Settings(
+                shelly_host="plug.local",
+                cerbo_mock_enabled=True,
+            ),
             system_factory=lambda settings: FakeSystem(),
             plug_client_factory=lambda settings: FakePlugClient(),
         )
@@ -53,12 +64,14 @@ class ApiTests(unittest.TestCase):
         self.assertIn("decision", payload)
         self.assertIn("plug", payload)
         self.assertIn("control_loop", payload)
+        self.assertIn("telemetry", payload)
+        self.assertIn("runtime", payload)
         self.assertTrue(payload["plug"]["reachable"])
 
     def test_override_on_endpoint_accepts_minutes(self) -> None:
         app = create_app(
             env_file=".env",
-            settings_loader=lambda env_file: Settings(),
+            settings_loader=lambda env_file: Settings(cerbo_mock_enabled=True),
             system_factory=lambda settings: FakeSystem(),
             plug_client_factory=lambda settings: FakePlugClient(),
         )
@@ -74,7 +87,7 @@ class ApiTests(unittest.TestCase):
     def test_emergency_off_endpoint_sets_persistent_override(self) -> None:
         app = create_app(
             env_file=".env",
-            settings_loader=lambda env_file: Settings(),
+            settings_loader=lambda env_file: Settings(cerbo_mock_enabled=True),
             system_factory=lambda settings: FakeSystem(),
             plug_client_factory=lambda settings: FakePlugClient(),
         )
@@ -96,7 +109,7 @@ class ApiTests(unittest.TestCase):
 
             app = create_app(
                 env_file=".env",
-                settings_loader=lambda env_file: Settings(),
+                settings_loader=lambda env_file: Settings(cerbo_mock_enabled=True),
                 system_factory=lambda settings: FakeSystem(),
                 plug_client_factory=lambda settings: FakePlugClient(),
                 frontend_dist=frontend_dir,
@@ -116,21 +129,38 @@ class ApiTests(unittest.TestCase):
     def test_sse_events_endpoint_returns_event_stream(self) -> None:
         app = create_app(
             env_file=".env",
-            settings_loader=lambda env_file: Settings(),
+            settings_loader=lambda env_file: Settings(cerbo_mock_enabled=True),
             system_factory=lambda settings: FakeSystem(),
             plug_client_factory=lambda settings: FakePlugClient(),
         )
 
         with TestClient(app) as client:
-            with client.stream("GET", "/api/events") as response:
-                self.assertEqual(response.status_code, 200)
-                content_type = response.headers.get("content-type", "")
-                self.assertIn("text/event-stream", content_type)
+            route = next(route for route in app.routes if getattr(route, "path", None) == "/api/events")
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/api/events",
+                    "headers": [],
+                    "query_string": b"",
+                    "client": ("testclient", 123),
+                    "server": ("testserver", 80),
+                    "scheme": "http",
+                },
+                receive=_build_receive(),
+            )
+            response = asyncio.run(route.endpoint(request))
+
+        self.assertIsInstance(response, StreamingResponse)
+        self.assertEqual(response.media_type, "text/event-stream")
 
     def test_status_includes_control_interval(self) -> None:
         app = create_app(
             env_file=".env",
-            settings_loader=lambda env_file: Settings(control_interval_seconds=60.0),
+            settings_loader=lambda env_file: Settings(
+                control_interval_seconds=60.0,
+                cerbo_mock_enabled=True,
+            ),
             system_factory=lambda settings: FakeSystem(),
             plug_client_factory=lambda settings: FakePlugClient(),
         )
@@ -143,11 +173,82 @@ class ApiTests(unittest.TestCase):
         self.assertIn("control_loop", payload)
         self.assertEqual(payload["control_loop"]["interval_seconds"], 60.0)
 
+    def test_health_includes_runtime_support_metadata(self) -> None:
+        app = create_app(
+            env_file=".env",
+            settings_loader=lambda env_file: Settings(cerbo_mock_enabled=True),
+            system_factory=lambda settings: FakeSystem(),
+            plug_client_factory=lambda settings: FakePlugClient(),
+        )
+
+        with TestClient(app) as client:
+            response = client.get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("runtime", payload)
+        self.assertFalse(payload["runtime"]["mqtt_requested"])
+
+    def test_app_starts_when_windows_like_runtime_has_mqtt_disabled(self) -> None:
+        app = create_app(
+            env_file=".env",
+            settings_loader=lambda env_file: Settings(cerbo_mqtt_enabled=False, cerbo_mock_enabled=True),
+            system_factory=lambda settings: FakeSystem(),
+            plug_client_factory=lambda settings: FakePlugClient(),
+        )
+
+        runtime = RuntimeSupport(
+            platform_system="Windows",
+            platform_release="11",
+            os_name="nt",
+            is_native_windows=True,
+            is_wsl=False,
+            mqtt_requested=False,
+            mqtt_supported=True,
+            reason=None,
+        )
+
+        with patch("vrm_solar_automation.api.detect_runtime_support", return_value=runtime):
+            with TestClient(app) as client:
+                response = client.get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_app_fails_fast_when_windows_like_runtime_has_mqtt_enabled(self) -> None:
+        app = create_app(
+            env_file=".env",
+            settings_loader=lambda env_file: Settings(cerbo_mqtt_enabled=True),
+            system_factory=lambda settings: FakeSystem(),
+            plug_client_factory=lambda settings: FakePlugClient(),
+        )
+
+        runtime = RuntimeSupport(
+            platform_system="Windows",
+            platform_release="11",
+            os_name="nt",
+            is_native_windows=True,
+            is_wsl=False,
+            mqtt_requested=True,
+            mqtt_supported=False,
+            reason="Native Windows development does not support the Cerbo MQTT transport.",
+        )
+
+        with patch("vrm_solar_automation.api.detect_runtime_support", return_value=runtime):
+            with self.assertRaises(RuntimeError):
+                with TestClient(app):
+                    pass
+
 
 if FASTAPI_AVAILABLE and HTTPX_AVAILABLE:
     class FakeSystem:
         def __init__(self):
             self.control_calls = 0
+
+        async def evaluate_with_inputs(self, *, power, weather, power_status):
+            return await self.evaluate()
+
+        async def control_with_inputs(self, *, power, weather, power_status):
+            return await self.control()
 
         async def evaluate(self):
             return (
@@ -295,6 +396,13 @@ if FASTAPI_AVAILABLE and HTTPX_AVAILABLE:
                 "current_amps": 0.8,
                 "temperature_c": 21.0,
             }
+
+
+def _build_receive():
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return receive
 
 
 if __name__ == "__main__":

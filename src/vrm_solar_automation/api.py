@@ -6,8 +6,8 @@ import contextlib
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator, Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +20,10 @@ from starlette.responses import StreamingResponse
 
 from . import db
 from .config import Settings, load_settings
+from .runtime import RuntimeSupport, detect_runtime_support, ensure_supported_runtime
 from .shelly import ShellyError, ShellyPlugClient
 from .system import PumpControlSystem
+from .telemetry import ControlCoordinator, TelemetryHub
 
 
 class TimedOverrideRequest(BaseModel):
@@ -33,6 +35,17 @@ SystemFactory = Callable[[Settings], PumpControlSystem]
 PlugClientFactory = Callable[[Settings], ShellyPlugClient]
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_windows_asyncio_policy() -> None:
+    if os.name != "nt":
+        return
+    selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if selector_policy is None:
+        return
+    current_policy = asyncio.get_event_loop_policy()
+    if not isinstance(current_policy, selector_policy):
+        asyncio.set_event_loop_policy(selector_policy())
 
 
 def _build_plug_client(settings: Settings) -> ShellyPlugClient:
@@ -59,23 +72,44 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
+        settings = get_settings()
+        runtime_support = detect_runtime_support(settings)
+        logger.info(
+            "Runtime support: system=%s release=%s native_windows=%s mqtt_requested=%s mqtt_supported=%s",
+            runtime_support.platform_system,
+            runtime_support.platform_release,
+            runtime_support.is_native_windows,
+            runtime_support.mqtt_requested,
+            runtime_support.mqtt_supported,
+        )
+        ensure_supported_runtime(settings, runtime_support)
         try:
-            db.setup_database(get_settings().database_file)
+            db.setup_database(settings.database_file)
         except Exception:
             logger.exception("Failed to setup metrics database")
-            
-        app.state.control_loop = _build_control_loop_snapshot()
+
+        telemetry_hub = TelemetryHub(settings, runtime_support=runtime_support)
+        coordinator = ControlCoordinator(
+            settings,
+            telemetry_hub,
+            system_factory=system_factory,
+            plug_client_factory=plug_client_factory,
+        )
+
+        app.state.settings = settings
+        app.state.runtime_support = runtime_support
+        app.state.telemetry_hub = telemetry_hub
+        app.state.coordinator = coordinator
         app.state.sse_clients: set[asyncio.Queue] = set()
-        await _run_control_loop_iteration(app, get_settings, system_factory, plug_client_factory)
-        task = asyncio.create_task(_run_control_loop(app, get_settings, system_factory, plug_client_factory))
+        coordinator.subscribe(lambda payload: _broadcast_sse(app, payload))
+
+        await telemetry_hub.start()
+        await coordinator.start()
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            app.state.control_loop["is_active"] = False
-            app.state.control_loop["is_iteration_in_progress"] = False
+            await coordinator.stop()
+            await telemetry_hub.stop()
             for queue in app.state.sse_clients:
                 await queue.put(None)
             app.state.sse_clients.clear()
@@ -96,18 +130,18 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict[str, object]:
-        return {"ok": True, "control_loop": _control_loop_snapshot(app)}
+        payload = await app.state.coordinator.get_status_payload()
+        return {
+            "ok": True,
+            "control_loop": payload.get("control_loop", {}),
+            "telemetry": payload.get("telemetry", {}),
+            "runtime": _runtime_support_payload(app),
+        }
 
     @app.get("/api/status")
     async def status() -> dict[str, object]:
-        settings = get_settings()
-        system = system_factory(settings)
-        decision, payload = await system.evaluate()
-        payload["decision"] = decision.to_dict()
-        payload["plug"] = await _fetch_plug_status(settings, plug_client_factory)
-        snapshot = _control_loop_snapshot(app)
-        snapshot["interval_seconds"] = settings.control_interval_seconds
-        payload["control_loop"] = snapshot
+        payload = await app.state.coordinator.get_status_payload()
+        payload["runtime"] = _runtime_support_payload(app)
         return payload
 
     @app.get("/api/events")
@@ -116,14 +150,22 @@ def create_app(
         app.state.sse_clients.add(queue)
 
         async def event_stream() -> AsyncGenerator[str, None]:
+            last_keepalive_at = time.monotonic()
             try:
+                initial_payload = await app.state.coordinator.get_status_payload()
+                if initial_payload:
+                    initial_payload = dict(initial_payload)
+                    initial_payload["runtime"] = _runtime_support_payload(app)
+                    yield f"event: status_update\ndata: {json.dumps(initial_payload)}\n\n"
                 while True:
                     if await request.is_disconnected():
                         break
                     try:
-                        data = await asyncio.wait_for(queue.get(), timeout=30.0)
+                        data = await asyncio.wait_for(queue.get(), timeout=1.0)
                     except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"
+                        if time.monotonic() - last_keepalive_at >= 30.0:
+                            yield ": keepalive\n\n"
+                            last_keepalive_at = time.monotonic()
                         continue
                     if data is None:
                         break
@@ -142,53 +184,55 @@ def create_app(
 
     @app.get("/api/plug/status")
     async def plug_status() -> dict[str, object]:
-        return await _fetch_plug_status(get_settings(), plug_client_factory)
+        return await _fetch_plug_status(app.state.settings, plug_client_factory)
 
     @app.post("/api/control/run")
     async def run_control() -> dict[str, object]:
-        settings = get_settings()
-        system = system_factory(settings)
-        _, payload = await system.control()
-        payload["plug"] = await _fetch_plug_status(settings, plug_client_factory)
-        payload["control_loop"] = _control_loop_snapshot(app)
+        payload = await app.state.coordinator.run_manual_control()
+        payload["runtime"] = _runtime_support_payload(app)
         return payload
 
     @app.get("/api/override")
     async def override_status() -> dict[str, object]:
-        settings = get_settings()
-        return system_factory(settings).read_override()
+        return system_factory(app.state.settings).read_override()
 
     @app.post("/api/override/on")
     async def override_on(request: TimedOverrideRequest) -> dict[str, object]:
-        settings = get_settings()
-        return await system_factory(settings).set_manual_on_override(
+        payload = await system_factory(app.state.settings).set_manual_on_override(
             duration_minutes=request.minutes,
         )
+        await app.state.coordinator.refresh_status(broadcast=True)
+        return payload
 
     @app.post("/api/override/off")
     async def override_off(request: TimedOverrideRequest) -> dict[str, object]:
-        settings = get_settings()
-        return await system_factory(settings).set_manual_off_override(
+        payload = await system_factory(app.state.settings).set_manual_off_override(
             duration_minutes=request.minutes,
         )
+        await app.state.coordinator.refresh_status(broadcast=True)
+        return payload
 
     @app.post("/api/override/off-until-auto-on")
     async def override_off_until_auto_on() -> dict[str, object]:
-        settings = get_settings()
-        return await system_factory(settings).set_manual_off_until_next_auto_on_override()
+        payload = await system_factory(app.state.settings).set_manual_off_until_next_auto_on_override()
+        await app.state.coordinator.refresh_status(broadcast=True)
+        return payload
 
     @app.post("/api/override/emergency-off")
     async def override_emergency_off() -> dict[str, object]:
-        settings = get_settings()
-        return await system_factory(settings).set_emergency_off_override()
+        payload = await system_factory(app.state.settings).set_emergency_off_override()
+        await app.state.coordinator.refresh_status(broadcast=True)
+        return payload
 
     @app.delete("/api/override")
     async def clear_override() -> dict[str, object]:
-        settings = get_settings()
-        return await system_factory(settings).clear_override()
+        payload = await system_factory(app.state.settings).clear_override()
+        await app.state.coordinator.refresh_status(broadcast=True)
+        return payload
 
     _configure_frontend_routes(app, frontend_dist)
     return app
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -247,85 +291,9 @@ async def _fetch_plug_status(
         }
 
 
-def _build_control_loop_snapshot() -> dict[str, object]:
-    return {
-        "is_active": False,
-        "is_iteration_in_progress": False,
-        "interval_seconds": None,
-        "last_started_at_iso": None,
-        "last_completed_at_iso": None,
-        "last_actuation_status": None,
-        "last_error": None,
-    }
-
-
-def _control_loop_snapshot(app: FastAPI) -> dict[str, object]:
-    snapshot = getattr(app.state, "control_loop", None)
-    if snapshot is None:
-        return _build_control_loop_snapshot()
-    return dict(snapshot)
-
-
-async def _run_control_loop(
-    app: FastAPI,
-    get_settings: Callable[[], Settings],
-    system_factory: SystemFactory,
-    plug_client_factory: PlugClientFactory,
-) -> None:
-    snapshot = app.state.control_loop
-    snapshot["is_active"] = True
-
-    while True:
-        interval_seconds = snapshot["interval_seconds"] or 60.0
-        await asyncio.sleep(interval_seconds)
-        await _run_control_loop_iteration(app, get_settings, system_factory, plug_client_factory)
-
-
-async def _run_control_loop_iteration(
-    app: FastAPI,
-    get_settings: Callable[[], Settings],
-    system_factory: SystemFactory,
-    plug_client_factory: PlugClientFactory,
-) -> None:
-    snapshot = app.state.control_loop
-    snapshot["is_active"] = True
-    snapshot["is_iteration_in_progress"] = True
-    snapshot["last_started_at_iso"] = datetime.now(UTC).isoformat()
-
-    try:
-        settings = get_settings()
-        snapshot["interval_seconds"] = max(1.0, float(settings.control_interval_seconds))
-        system = system_factory(settings)
-        _, payload = await system.control()
-        snapshot["last_actuation_status"] = payload.get("actuation", {}).get("status")
-        snapshot["last_error"] = None
-
-        # Build a full status-like payload and push to SSE clients
-        try:
-            plug_data = await _fetch_plug_status(settings, plug_client_factory)
-        except Exception:
-            plug_data = {"configured": False, "reachable": False, "error": "unavailable", "status": None}
-        loop_snapshot = dict(snapshot)
-        loop_snapshot["interval_seconds"] = settings.control_interval_seconds
-        payload["plug"] = plug_data
-        payload["control_loop"] = loop_snapshot
-        _broadcast_sse(app, payload)
-
-        try:
-            await asyncio.to_thread(db.insert_metrics, settings.database_file, payload)
-        except Exception:
-            logger.exception("Failed to save metrics to database")
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        snapshot["last_error"] = _describe_exception(exc)
-        logger.exception("Automatic control loop iteration failed.")
-    finally:
-        snapshot["last_completed_at_iso"] = datetime.now(UTC).isoformat()
-        snapshot["is_iteration_in_progress"] = False
-
-
 def _broadcast_sse(app: FastAPI, payload: dict[str, object]) -> None:
+    payload = dict(payload)
+    payload["runtime"] = _runtime_support_payload(app)
     clients: set[asyncio.Queue] = getattr(app.state, "sse_clients", set())
     for queue in clients:
         try:
@@ -334,12 +302,11 @@ def _broadcast_sse(app: FastAPI, payload: dict[str, object]) -> None:
             pass
 
 
-def _describe_exception(exc: Exception) -> str:
-    if isinstance(exc, HTTPException):
-        detail = exc.detail
-        if isinstance(detail, str) and detail:
-            return detail
-    return str(exc) or exc.__class__.__name__
+def _runtime_support_payload(app: FastAPI) -> dict[str, object] | None:
+    support: RuntimeSupport | None = getattr(app.state, "runtime_support", None)
+    if support is None:
+        return None
+    return support.to_dict()
 
 
 def _configure_frontend_routes(app: FastAPI, frontend_dist: str | Path | None) -> None:
@@ -381,6 +348,7 @@ def _default_frontend_dist() -> Path:
     return Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
+_configure_windows_asyncio_policy()
 app = create_app()
 
 

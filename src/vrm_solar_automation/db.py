@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,7 +13,7 @@ def setup_database(db_path: str | Path) -> None:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         # Enable Write-Ahead Logging for better concurrent read/write and less SD wear
         conn.execute("PRAGMA journal_mode=WAL;")
         
@@ -65,7 +66,7 @@ def insert_metrics(db_path: str | Path, payload: dict[str, object]) -> None:
         
         raw_payload = json.dumps(payload, sort_keys=True)
         
-        with sqlite3.connect(path) as conn:
+        with closing(sqlite3.connect(path)) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO metrics (
                     timestamp_unix_ms,

@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useRef, useState } from "react";
 
 const POLL_INTERVAL_MS = 60000;
 const COUNTDOWN_SECONDS = 60;
@@ -77,7 +77,7 @@ function App() {
     resetCountdown();
   }, [resetCountdown]);
 
-  const fetchStatus = useEffectEvent(async ({ silent = false } = {}) => {
+  const fetchStatus = useCallback(async ({ silent = false } = {}) => {
     if (!silent) {
       setIsLoading(true);
     }
@@ -99,7 +99,7 @@ function App() {
         setIsLoading(false);
       }
     }
-  });
+  }, [applyStatusPayload]);
 
   // Smooth countdown animation via requestAnimationFrame
   useEffect(() => {
@@ -117,12 +117,35 @@ function App() {
 
   // SSE connection with polling fallback
   useEffect(() => {
-    fetchStatus();
+    void fetchStatus();
 
     let eventSource;
     let fallbackIntervalId;
+    let retryTimeoutId;
+    let isDisposed = false;
+
+    function clearFallbackPolling() {
+      if (fallbackIntervalId) {
+        window.clearInterval(fallbackIntervalId);
+        fallbackIntervalId = null;
+      }
+    }
+
+    function scheduleReconnect() {
+      if (isDisposed || retryTimeoutId) {
+        return;
+      }
+      retryTimeoutId = window.setTimeout(() => {
+        retryTimeoutId = null;
+        connectSSE();
+      }, 5000);
+    }
 
     function connectSSE() {
+      if (isDisposed) {
+        return;
+      }
+
       eventSource = new EventSource("/api/events");
 
       eventSource.addEventListener("status_update", (event) => {
@@ -139,31 +162,28 @@ function App() {
         // Fall back to polling and retry SSE later
         if (!fallbackIntervalId) {
           fallbackIntervalId = window.setInterval(() => {
-            fetchStatus({ silent: true });
+            void fetchStatus({ silent: true });
           }, POLL_INTERVAL_MS);
         }
-        window.setTimeout(() => {
-          connectSSE();
-        }, 5000);
+        scheduleReconnect();
       };
 
       // If SSE connects, stop fallback polling
       eventSource.onopen = () => {
-        if (fallbackIntervalId) {
-          window.clearInterval(fallbackIntervalId);
-          fallbackIntervalId = null;
-        }
+        clearFallbackPolling();
       };
     }
 
     connectSSE();
 
     return () => {
+      isDisposed = true;
       if (eventSource) {
         eventSource.close();
       }
-      if (fallbackIntervalId) {
-        window.clearInterval(fallbackIntervalId);
+      clearFallbackPolling();
+      if (retryTimeoutId) {
+        window.clearTimeout(retryTimeoutId);
       }
     };
   }, [fetchStatus, applyStatusPayload]);
@@ -265,11 +285,11 @@ function App() {
               <span className="stat-label">Plug</span>
               <span className="stat-value">{describeBinary(plugOutputIsOn, "ON", "OFF")}</span>
             </div>
-            <div className={`live-stat-chip tone-${Number(power.battery_soc_percent) >= 72 ? "good" : Number(power.battery_soc_percent) >= 55 ? "warn" : "danger"}`}>
+            <div className={`live-stat-chip tone-${Number(power.battery_soc_percent) >= 60 ? "good" : Number(power.battery_soc_percent) > 50 ? "warn" : "danger"}`}>
               <span className="stat-label">Battery</span>
               <span className="stat-value">{formatPercent(power.battery_soc_percent)}</span>
             </div>
-            <div className={`live-stat-chip tone-${Number(power.solar_watts) >= 2500 ? "good" : Number(power.solar_watts) > 100 ? "info" : "muted"}`}>
+            <div className={`live-stat-chip tone-${Number(power.solar_watts) > 0 ? "info" : "muted"}`}>
               <span className="stat-label">Solar</span>
               <span className="stat-value">{formatWatts(power.solar_watts)}</span>
             </div>
@@ -358,12 +378,12 @@ function App() {
             <ProgressMeter
               label="Battery reserve"
               value={coercePercent(power.battery_soc_percent)}
-              tone={coercePercent(power.battery_soc_percent) >= 72 ? "good" : coercePercent(power.battery_soc_percent) >= 55 ? "warn" : "danger"}
+              tone={coercePercent(power.battery_soc_percent) >= 60 ? "good" : coercePercent(power.battery_soc_percent) > 50 ? "warn" : "danger"}
             />
             <ProgressMeter
-              label="Solar support"
+              label="Solar output"
               value={capPercent(power.solar_watts, 4000)}
-              tone={Number(power.solar_watts) >= 2500 ? "good" : "info"}
+              tone={Number(power.solar_watts) > 0 ? "info" : "muted"}
             />
             <ProgressMeter
               label="Generator presence"
@@ -376,6 +396,9 @@ function App() {
             <DetailPill label="Site identifier" value={power.site_identifier || "Unavailable"} />
             <DetailPill label="Input source" value={formatInputSource(power.active_input_source)} />
             <DetailPill label="Telemetry" value={powerStatus.available === false ? "Unavailable" : "Live"} />
+            <DetailPill label="House L1" value={formatWatts(power.house_l1_watts)} />
+            <DetailPill label="House L2" value={formatWatts(power.house_l2_watts)} />
+            <DetailPill label="House L3" value={formatWatts(power.house_l3_watts)} />
           </div>
         </Panel>
 

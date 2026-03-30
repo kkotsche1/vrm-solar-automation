@@ -16,6 +16,9 @@ class PowerSnapshot:
     active_input_source: int | None
     queried_at_unix_ms: int | None
     queried_at_iso: str | None
+    house_l1_watts: float | None = None
+    house_l2_watts: float | None = None
+    house_l3_watts: float | None = None
 
     def to_dict(self) -> dict[str, float | int | str | None]:
         return asdict(self)
@@ -33,6 +36,9 @@ class PowerSnapshot:
         generator_watts: float | None,
         active_input_source: int | None,
         queried_at_unix_ms: int | None,
+        house_l1_watts: float | None = None,
+        house_l2_watts: float | None = None,
+        house_l3_watts: float | None = None,
     ) -> "PowerSnapshot":
         queried_at_iso = None
         if queried_at_unix_ms is not None:
@@ -48,6 +54,9 @@ class PowerSnapshot:
             battery_soc_percent=battery_soc_percent,
             solar_watts=solar_watts,
             house_watts=house_watts,
+            house_l1_watts=house_l1_watts,
+            house_l2_watts=house_l2_watts,
+            house_l3_watts=house_l3_watts,
             generator_watts=generator_watts,
             active_input_source=active_input_source,
             queried_at_unix_ms=queried_at_unix_ms,

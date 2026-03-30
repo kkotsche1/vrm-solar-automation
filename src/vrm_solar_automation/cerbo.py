@@ -8,11 +8,23 @@ import struct
 from .models import PowerSnapshot
 
 SYSTEM_UNIT_ID = 100
-REGISTER_TOTAL_CONSUMPTION_W = 817
+REGISTER_AC_CONSUMPTION_TOTAL_W = 817
+REGISTER_AC_CONSUMPTION_L1_W = 818
+REGISTER_AC_CONSUMPTION_L2_W = 819
+REGISTER_AC_CONSUMPTION_L3_W = 820
 REGISTER_GENSETS_L1_W = 823
 REGISTER_GENSETS_L2_W = 824
 REGISTER_GENSETS_L3_W = 825
 REGISTER_ACTIVE_INPUT_SOURCE = 826
+REGISTER_PV_ON_OUTPUT_L1_W = 808
+REGISTER_PV_ON_OUTPUT_L2_W = 809
+REGISTER_PV_ON_OUTPUT_L3_W = 810
+REGISTER_PV_ON_GRID_L1_W = 811
+REGISTER_PV_ON_GRID_L2_W = 812
+REGISTER_PV_ON_GRID_L3_W = 813
+REGISTER_PV_ON_GENSETS_L1_W = 814
+REGISTER_PV_ON_GENSETS_L2_W = 815
+REGISTER_PV_ON_GENSETS_L3_W = 816
 REGISTER_BATTERY_POWER_W = 842
 REGISTER_BATTERY_SOC_PERCENT = 843
 REGISTER_SOLAR_POWER_W = 850
@@ -112,10 +124,26 @@ class CerboProbeClient:
             unit_id=SYSTEM_UNIT_ID,
             register=REGISTER_SOLAR_POWER_W,
         )
+        ac_pv_phase_raws = [
+            self._read_optional_input_register(REGISTER_PV_ON_OUTPUT_L1_W),
+            self._read_optional_input_register(REGISTER_PV_ON_OUTPUT_L2_W),
+            self._read_optional_input_register(REGISTER_PV_ON_OUTPUT_L3_W),
+            self._read_optional_input_register(REGISTER_PV_ON_GRID_L1_W),
+            self._read_optional_input_register(REGISTER_PV_ON_GRID_L2_W),
+            self._read_optional_input_register(REGISTER_PV_ON_GRID_L3_W),
+            self._read_optional_input_register(REGISTER_PV_ON_GENSETS_L1_W),
+            self._read_optional_input_register(REGISTER_PV_ON_GENSETS_L2_W),
+            self._read_optional_input_register(REGISTER_PV_ON_GENSETS_L3_W),
+        ]
         total_consumption_raw = self._client.read_input_register(
             unit_id=SYSTEM_UNIT_ID,
-            register=REGISTER_TOTAL_CONSUMPTION_W,
+            register=REGISTER_AC_CONSUMPTION_TOTAL_W,
         )
+        ac_consumption_phase_raws = [
+            self._read_optional_input_register(REGISTER_AC_CONSUMPTION_L1_W),
+            self._read_optional_input_register(REGISTER_AC_CONSUMPTION_L2_W),
+            self._read_optional_input_register(REGISTER_AC_CONSUMPTION_L3_W),
+        ]
         generator_phase_raws = [
             self._read_optional_input_register(REGISTER_GENSETS_L1_W),
             self._read_optional_input_register(REGISTER_GENSETS_L2_W),
@@ -127,6 +155,20 @@ class CerboProbeClient:
         # future policy refinements, but the current snapshot exposes the core
         # control inputs only.
         _battery_power_w = uint16_to_int16(battery_power_raw)
+        dc_pv_watts = max(0, uint16_to_int16(solar_power_raw))
+        ac_pv_watts = sum(
+            max(0, uint16_to_int16(raw))
+            for raw in ac_pv_phase_raws
+            if raw is not None
+        )
+        house_phase_watts = [
+            float(max(0, uint16_to_int16(raw))) if raw is not None else None
+            for raw in ac_consumption_phase_raws
+        ]
+        if any(raw is not None for raw in ac_consumption_phase_raws):
+            house_watts = float(sum(watts for watts in house_phase_watts if watts is not None))
+        else:
+            house_watts = float(max(0, uint16_to_int16(total_consumption_raw)))
         generator_watts = None
         if any(raw is not None for raw in generator_phase_raws):
             generator_watts = float(
@@ -139,8 +181,11 @@ class CerboProbeClient:
             site_name=self._settings.site_name,
             site_identifier=self._settings.site_identifier,
             battery_soc_percent=float(battery_soc_raw),
-            solar_watts=float(uint16_to_int16(solar_power_raw)),
-            house_watts=float(uint16_to_int16(total_consumption_raw)),
+            solar_watts=float(dc_pv_watts + ac_pv_watts),
+            house_watts=house_watts,
+            house_l1_watts=house_phase_watts[0],
+            house_l2_watts=house_phase_watts[1],
+            house_l3_watts=house_phase_watts[2],
             generator_watts=generator_watts,
             active_input_source=active_input_source,
             queried_at_unix_ms=queried_at_unix_ms,
@@ -152,5 +197,5 @@ class CerboProbeClient:
                 unit_id=SYSTEM_UNIT_ID,
                 register=register,
             )
-        except RuntimeError:
+        except (OSError, TimeoutError, RuntimeError):
             return None

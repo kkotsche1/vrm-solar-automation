@@ -17,10 +17,20 @@ class Settings:
     cerbo_site_name: str = "Alaro (Cerbo GX)"
     cerbo_site_identifier: str = "cerbo-local"
     cerbo_mock_enabled: bool = False
+    cerbo_mqtt_enabled: bool = False
+    cerbo_mqtt_host: str | None = None
+    cerbo_mqtt_port: int = 1883
+    cerbo_mqtt_username: str | None = None
+    cerbo_mqtt_password: str | None = None
     weather_latitude: float = 39.707337
     weather_longitude: float = 2.791675
     weather_timezone: str = "Europe/Madrid"
     control_interval_seconds: float = 60.0
+    telemetry_stale_after_seconds: float = 90.0
+    modbus_fallback_poll_seconds: float = 30.0
+    policy_debounce_ms: int = 500
+    policy_min_run_interval_seconds: float = 5.0
+    weather_refresh_seconds: float = 900.0
     state_file: str = ".state/pump-policy-state.json"
     database_file: str = ".state/metrics.db"
     shelly_host: str | None = None
@@ -81,6 +91,19 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         "yes",
         "on",
     }
+    cerbo_mqtt_enabled = values.get("CERBO_MQTT_ENABLED", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    cerbo_mqtt_host = values.get("CERBO_MQTT_HOST", cerbo_host)
+    cerbo_mqtt_port = int(values.get("CERBO_MQTT_PORT", "1883"))
+    telemetry_stale_after_seconds = float(values.get("TELEMETRY_STALE_AFTER_SECONDS", "90.0"))
+    modbus_fallback_poll_seconds = float(values.get("MODBUS_FALLBACK_POLL_SECONDS", "30.0"))
+    policy_debounce_ms = int(values.get("POLICY_DEBOUNCE_MS", "500"))
+    policy_min_run_interval_seconds = float(values.get("POLICY_MIN_RUN_INTERVAL_SECONDS", "5.0"))
+    weather_refresh_seconds = float(values.get("WEATHER_REFRESH_SECONDS", "900.0"))
 
     weather_latitude = float(values.get("WEATHER_LATITUDE", "39.707337"))
     weather_longitude = float(values.get("WEATHER_LONGITUDE", "2.791675"))
@@ -102,10 +125,20 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         cerbo_site_name=cerbo_site_name,
         cerbo_site_identifier=cerbo_site_identifier,
         cerbo_mock_enabled=cerbo_mock_enabled,
+        cerbo_mqtt_enabled=cerbo_mqtt_enabled,
+        cerbo_mqtt_host=cerbo_mqtt_host,
+        cerbo_mqtt_port=cerbo_mqtt_port,
+        cerbo_mqtt_username=values.get("CERBO_MQTT_USERNAME"),
+        cerbo_mqtt_password=values.get("CERBO_MQTT_PASSWORD"),
         weather_latitude=weather_latitude,
         weather_longitude=weather_longitude,
         weather_timezone=weather_timezone,
         control_interval_seconds=control_interval_seconds,
+        telemetry_stale_after_seconds=telemetry_stale_after_seconds,
+        modbus_fallback_poll_seconds=modbus_fallback_poll_seconds,
+        policy_debounce_ms=policy_debounce_ms,
+        policy_min_run_interval_seconds=policy_min_run_interval_seconds,
+        weather_refresh_seconds=weather_refresh_seconds,
         state_file=state_file,
         database_file=database_file,
         shelly_host=values.get("SHELLY_HOST"),

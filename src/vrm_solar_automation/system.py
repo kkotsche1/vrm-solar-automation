@@ -76,8 +76,33 @@ class PumpControlSystem:
         self._state_store = state_store or StateStore(settings.state_file)
 
     async def evaluate(self) -> tuple[PumpDecision, dict[str, object]]:
-        decision, power, weather, previous_state, next_state, override, power_status = (
-            await self._evaluate_policy()
+        power, power_status = await self._fetch_power()
+        weather = await self._fetch_weather()
+        return await self.evaluate_with_inputs(
+            power=power,
+            weather=weather,
+            power_status=power_status,
+        )
+
+    async def control(self) -> tuple[PumpDecision, dict[str, object]]:
+        power, power_status = await self._fetch_power()
+        weather = await self._fetch_weather()
+        return await self.control_with_inputs(
+            power=power,
+            weather=weather,
+            power_status=power_status,
+        )
+
+    async def evaluate_with_inputs(
+        self,
+        *,
+        power: PowerSnapshot,
+        weather: WeatherSnapshot,
+        power_status: TelemetryStatus,
+    ) -> tuple[PumpDecision, dict[str, object]]:
+        decision, previous_state, next_state, override = self._evaluate_policy_with_inputs(
+            power=power,
+            weather=weather,
         )
 
         return decision, self._build_payload(
@@ -90,9 +115,16 @@ class PumpControlSystem:
             power_status=power_status,
         )
 
-    async def control(self) -> tuple[PumpDecision, dict[str, object]]:
-        decision, power, weather, previous_state, next_state, override, power_status = (
-            await self._evaluate_policy()
+    async def control_with_inputs(
+        self,
+        *,
+        power: PowerSnapshot,
+        weather: WeatherSnapshot,
+        power_status: TelemetryStatus,
+    ) -> tuple[PumpDecision, dict[str, object]]:
+        decision, previous_state, next_state, override = self._evaluate_policy_with_inputs(
+            power=power,
+            weather=weather,
         )
 
         self._state_store.save(next_state)
@@ -259,7 +291,23 @@ class PumpControlSystem:
     ]:
         power, power_status = await self._fetch_power()
         weather = await self._fetch_weather()
+        decision, previous_state, next_state, override = self._evaluate_policy_with_inputs(
+            power=power,
+            weather=weather,
+        )
+        return decision, power, weather, previous_state, next_state, override, power_status
 
+    def _evaluate_policy_with_inputs(
+        self,
+        *,
+        power: PowerSnapshot,
+        weather: WeatherSnapshot,
+    ) -> tuple[
+        PumpDecision,
+        PumpPolicyState | None,
+        PumpPolicyState,
+        PumpOverrideResult,
+    ]:
         previous_state = self._state_store.load()
         decision = self._policy.decide(
             power=power,
@@ -272,8 +320,7 @@ class PumpControlSystem:
             automatic_target_is_on=decision.should_turn_on,
             power=power,
         )
-
-        return decision, power, weather, previous_state, next_state, override, power_status
+        return decision, previous_state, next_state, override
 
     async def _fetch_power(self) -> tuple[PowerSnapshot, TelemetryStatus]:
         power_source = getattr(self._probe_client, "source", "cerbo_modbus")

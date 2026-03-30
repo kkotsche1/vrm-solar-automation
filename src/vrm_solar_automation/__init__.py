@@ -3,6 +3,7 @@ from importlib import import_module
 from .client import VrmProbeClient
 from .models import PowerSnapshot
 from .policy import PumpDecision, PumpPolicy, PumpPolicyConfig
+from .runtime import RuntimeSupport, detect_runtime_support, ensure_supported_runtime
 from .shelly import (
     ShellyAuthenticationError,
     ShellyDeviceInfo,
@@ -14,11 +15,16 @@ from .shelly import (
     ShellySwitchStatus,
 )
 from .system import PumpActuationResult, PumpControlSystem, PumpOverrideResult
+from .telemetry import CerboMqttClient, ControlCoordinator, TelemetryHub, TelemetryRuntimeStatus
 
 __all__ = [
     "PowerSnapshot",
     "app",
     "create_app",
+    "CerboMqttClient",
+    "ControlCoordinator",
+    "detect_runtime_support",
+    "ensure_supported_runtime",
     "PumpActuationResult",
     "PumpDecision",
     "PumpControlSystem",
@@ -33,6 +39,9 @@ __all__ = [
     "ShellySettings",
     "ShellySwitchCommandResult",
     "ShellySwitchStatus",
+    "RuntimeSupport",
+    "TelemetryHub",
+    "TelemetryRuntimeStatus",
     "VrmProbeClient",
 ]
 
