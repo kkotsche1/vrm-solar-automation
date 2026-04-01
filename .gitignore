@@ -9,3 +9,7 @@ build/
 frontend/node_modules/
 frontend/dist/
 frontend/.npm-cache/
+
+
+.venv-wsl/
+.venv-wsl
