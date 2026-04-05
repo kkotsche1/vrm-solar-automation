@@ -1,66 +1,62 @@
 # VRM Solar Automation
 
-Python control scaffold for a Victron-driven circulation-pump automation. It runs on Windows today and is structured so the same code can later run on a Raspberry Pi.
+Python automation for a Cerbo GX and Shelly-controlled circulation pump. The project now runs as a script-first controller: one Python process performs one control cycle, and a Raspberry Pi scheduler triggers that cycle every 30 seconds.
 
 ## Current capabilities
 
-The project now has two layers:
+- `metrics`: fetch the current Cerbo GX power snapshot over Modbus TCP
+- `decide`: evaluate the automatic pump policy without actuating the plug
+- `control`: evaluate the policy and reconcile the Shelly plug when a fresh automatic state transition occurs
+- `db-upgrade`: apply Alembic migrations to create/update the automation database schema
+- `plug-*`: inspect or manually control the Shelly plug directly
+- `scripts/pump_control_snapshot.py`: run one controller cycle from a plain Python script for Raspberry Pi scheduling
+- `scripts/pump_control_loop.py`: run controller cycles continuously in a fixed interval loop (default 15 seconds)
 
-- `metrics`: fetches battery state of charge, solar production watts, and house load watts from the local Cerbo GX, using local MQTT as the preferred live feed and Modbus TCP as fallback
-- `decide`: combines VRM state, Alaro weather, and remembered prior pump state to decide whether the circulation pump should be on or off
-- `control`: evaluates the policy and reconciles the Shelly plug so the actual plug state matches the intended state whenever the plug is reachable
-- `api`: exposes the controller state and override actions over FastAPI for a local frontend running on the same Raspberry Pi
-- `override-*`: stores temporary manual overrides such as timed on/off and "stay off until the next fresh automatic on"
-- `plug-*`: talks directly to a Shelly Gen2/Gen3 switch component so we can fetch plug info, inspect current output state, and issue on/off commands with optional delayed execution
+Manual override is no longer stored in the backend. If the plug is changed in the Shelly app, the automation waits for a fresh automatic transition before reasserting the plug state:
 
-The decision engine is designed around simple, explainable rules rather than opaque scoring.
-The core data path is now local-first and LAN-only for power data, which is much better suited to on-site automation.
+- automatic `ON`, manual Shelly `OFF`: wait for automatic `OFF`, then a new automatic `ON`
+- automatic `OFF`, manual Shelly `ON`: wait for automatic `ON`, then a new automatic `OFF`
 
 ## Setup
 
-Create a virtual environment if you do not already have one:
+Create a virtual environment:
 
-```powershell
-py -3.13 -m venv .venv
+```bash
+python3 -m venv .venv
 ```
 
-Install dependencies:
+Install the package:
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e .
+```bash
+. .venv/bin/activate
+python -m pip install -e .
 ```
 
-Install the React dashboard dependencies:
+Create `.env` from `.env.example` and fill in your Cerbo GX and Shelly details.
 
-```powershell
-cd frontend
-npm install
-cd ..
-```
-
-Add credentials to `.env`:
+Key settings:
 
 ```dotenv
-VICTRON_SITE_ID=123456
-CERBO_HOST=192.168.68.66
+CERBO_HOST=192.168.68.84
 CERBO_PORT=502
 CERBO_SITE_NAME=Alaro (Cerbo GX)
 CERBO_SITE_IDENTIFIER=cerbo-local
 CERBO_MOCK_ENABLED=false
-CERBO_MQTT_ENABLED=false
-CERBO_MQTT_HOST=192.168.68.66
-CERBO_MQTT_PORT=1883
-CERBO_MQTT_USERNAME=
-CERBO_MQTT_PASSWORD=
 WEATHER_LATITUDE=39.707337
 WEATHER_LONGITUDE=2.791675
 WEATHER_TIMEZONE=Europe/Madrid
-CONTROL_INTERVAL_SECONDS=30
-TELEMETRY_STALE_AFTER_SECONDS=90
-MODBUS_FALLBACK_POLL_SECONDS=30
-POLICY_DEBOUNCE_MS=500
-POLICY_MIN_RUN_INTERVAL_SECONDS=5
-WEATHER_REFRESH_SECONDS=900
+BATTERY_MIN_SOC_PERCENT=45
+AUTO_OFF_START_LOCAL=18:00
+AUTO_RESUME_START_LOCAL=08:00
+SUMMER_START_MONTH_DAY=04-01
+WINTER_START_MONTH_DAY=10-01
+SUMMER_AUTO_OFF_START_LOCAL=18:30
+SUMMER_AUTO_RESUME_START_LOCAL=08:30
+WINTER_AUTO_OFF_START_LOCAL=17:30
+WINTER_AUTO_RESUME_START_LOCAL=09:00
+AUTO_CONTROL_TIMEZONE=Europe/Madrid
+DATABASE_URL=sqlite:///.state/automation.db
+DATABASE_AUTO_MIGRATE=false
 SHELLY_HOST=192.168.68.90
 SHELLY_PORT=80
 SHELLY_SWITCH_ID=0
@@ -68,318 +64,197 @@ SHELLY_USE_HTTPS=false
 SHELLY_USERNAME=admin
 SHELLY_PASSWORD=your-shelly-password
 SHELLY_TIMEOUT_SECONDS=5.0
+SMTP_GMAIL_SENDER=kkotsche1@gmail.com
+SMTP_GMAIL_APP_PASSWORD=your-gmail-app-password
+SMTP_GMAIL_RECIPIENTS=f.kotschenreuther@yahoo.de,monika_kotschenreuther@yahoo.de,kkotsche1@gmail.com
 ```
 
-`VICTRON_SITE_ID` is now optional metadata only. The controller itself reads the energy values from the Cerbo GX over your local network.
+`BATTERY_MIN_SOC_PERCENT` configures the single battery cutoff. It must be a numeric percentage between `0` and `100`. Automatic demand may run only when battery SOC is strictly above this value; at or below it, the pump stays off. The recommended starting value for this installation is `45`.
 
-If you are developing the frontend away from the Cerbo network, set `CERBO_MOCK_ENABLED=true` in `.env`. That swaps the live Modbus read for a fixed mock snapshot and lets the dashboard keep rendering realistic power data. To return to the real device later, set it back to `false` or remove the line.
+The controller now supports seasonal quiet-hours windows in `AUTO_CONTROL_TIMEZONE`. When the seasonal keys are present, the pump is forced `OFF` throughout the active quiet-hours window, regardless of SOC, and automatic `ON` resumes only after the configured morning time. The recommended schedule for this installation is:
 
-## Live telemetry
+- summer (`SUMMER_START_MONTH_DAY=04-01` until `WINTER_START_MONTH_DAY=10-01`): `18:30` to `08:30`
+- winter (all other dates): `17:30` to `09:00`
 
-The backend now keeps a shared live telemetry cache instead of probing the Cerbo on every `GET /api/status` request.
+`AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` remain available as a legacy year-round fallback when the seasonal keys are omitted.
 
-- Preferred path: Cerbo local MQTT updates feed the backend in near real time
-- Fallback path: Modbus polling takes over when MQTT is disabled, disconnected, or stale
-- Frontend path: FastAPI fans cached controller status to the dashboard over `GET /api/events`
+`DATABASE_URL` points to the SQLAlchemy database connection used for runtime state and historical tracking. `DATABASE_AUTO_MIGRATE=true` can be enabled to run Alembic migrations automatically when the controller starts.
 
-Supported runtime matrix:
+## Commands
 
-- Raspberry Pi / Linux with `CERBO_MQTT_ENABLED=true`: supported for live MQTT telemetry
-- Native Windows with `CERBO_MQTT_ENABLED=false`: supported for Modbus fallback or mock telemetry
-- Native Windows with `CERBO_MQTT_ENABLED=true`: not supported; backend startup now fails fast with an actionable error
-- WSL on Windows with `CERBO_MQTT_ENABLED=true`: acceptable when you need live MQTT development on a Windows machine
+Fetch raw Cerbo metrics:
 
-To enable the preferred path on the Cerbo:
-
-1. On the GX device, enable `Settings -> Integrations -> MQTT Access`.
-2. Set `CERBO_MQTT_ENABLED=true` in `.env`.
-3. Set `CERBO_SITE_IDENTIFIER` to the Cerbo VRM Portal ID, not the friendly site name, if you want the backend to send an immediate keepalive request and receive a full initial snapshot faster.
-
-When MQTT is enabled, the backend still keeps Modbus available as a fallback. If no usable MQTT telemetry arrives for `TELEMETRY_STALE_AFTER_SECONDS`, it switches to Modbus fallback reads every `MODBUS_FALLBACK_POLL_SECONDS` until MQTT recovers.
-
-## Run
-
-Fetch raw energy metrics:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation metrics
+```bash
+python -m vrm_solar_automation metrics
 ```
 
-Fetch metrics as JSON:
+Evaluate the policy without changing the plug:
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation metrics --json
+```bash
+python -m vrm_solar_automation decide
 ```
 
-Evaluate the pump policy:
+Run one full control cycle:
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation decide
+```bash
+python -m vrm_solar_automation control
 ```
 
-Evaluate the pump policy as JSON:
+Upgrade database schema to latest revision:
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation decide --json
+```bash
+python -m vrm_solar_automation db-upgrade
 ```
 
-Evaluate the policy and apply it to the Shelly plug:
+Run one full control cycle as JSON:
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation control
+```bash
+python -m vrm_solar_automation control --json
 ```
 
-Evaluate the policy and apply it to the Shelly plug as JSON:
+Run the Raspberry Pi script entrypoint:
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation control --json
+```bash
+python scripts/pump_control_snapshot.py --env-file .env
 ```
 
-Run the FastAPI backend:
+Run continuous control every 15 seconds in one long-lived process:
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation.api --host 0.0.0.0 --port 8000
+```bash
+python scripts/pump_control_loop.py --env-file .env --interval-seconds 15
 ```
 
-Or via the installed script:
+In long-running mode, weather is cached in memory per local weather day (`WEATHER_TIMEZONE`), so repeated cycles do not call Open-Meteo every interval. The cache resets when the process restarts.
 
-```powershell
-vrm-api --host 0.0.0.0 --port 8000
+Dry-run one cycle without actuation:
+
+```bash
+python scripts/pump_dry_run_snapshot.py --env-file .env
 ```
 
-When the FastAPI backend starts, it immediately launches the shared telemetry hub and cached controller coordinator. Automatic control now reacts to live telemetry with debounce and minimum-run throttling instead of relying only on a fixed request-time polling loop. `CONTROL_INTERVAL_SECONDS` remains available as compatibility metadata in the API payload and as a manual/fallback cadence indicator.
+Check the Shelly status directly:
 
-Build the dashboard for production so FastAPI can serve it from `/`:
-
-```powershell
-cd frontend
-npm run build
-cd ..
+```bash
+python -m vrm_solar_automation plug-status
 ```
 
-For local frontend development with live reload:
+Turn the plug on manually:
 
-```powershell
-cd frontend
-npm run dev
+```bash
+python -m vrm_solar_automation plug-on
 ```
 
-The Vite dev server runs on `http://127.0.0.1:5173` and proxies `/api/*` to the FastAPI backend on `http://127.0.0.1:8000`.
+Turn the plug off manually:
 
-Show the current temporary override:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation override-status
+```bash
+python -m vrm_solar_automation plug-off
 ```
 
-Force the pump on for 60 minutes:
+## Raspberry Pi scheduling
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation override-on --minutes 60
+The supported background model is external scheduling. The controller itself stays one-shot and exits after each cycle.
+
+Recommended cadence: every 30 seconds.
+
+Example `systemd` service:
+
+```ini
+[Unit]
+Description=VRM Solar Automation control cycle
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/vrm-solar-automation
+ExecStart=/home/pi/vrm-solar-automation/.venv/bin/python /home/pi/vrm-solar-automation/scripts/pump_control_snapshot.py --env-file /home/pi/vrm-solar-automation/.env
 ```
 
-Force the pump off for 90 minutes:
+Example `systemd` timer:
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation override-off --minutes 90
+```ini
+[Unit]
+Description=Run VRM Solar Automation every 30 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+Unit=vrm-solar-automation.service
+
+[Install]
+WantedBy=timers.target
 ```
 
-Keep the pump off until the controller sees the next fresh automatic ON signal:
+You can use `cron` instead if you prefer, but `systemd` timers are a better fit for 30-second scheduling.
 
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation override-off-until-auto-on
-```
+If you prefer a single long-running process, you can run:
 
-Clear the temporary override and return to automatic control:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation override-clear
-```
-
-Minimal direct Cerbo test:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\cerbo_modbus_snapshot.py
-```
-
-Fetch Shelly device info:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-info
-```
-
-Check Shelly switch status:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-status
-```
-
-Turn the plug on immediately:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-on
-```
-
-Turn the plug on now and let the Shelly device auto-turn it off after 10 minutes:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-on --toggle-after-seconds 600
-```
-
-Turn the plug off now and let the Shelly device auto-turn it back on after 30 seconds:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-off --toggle-after-seconds 30
-```
-
-Run a minimal live test that turns the plug on and lets the Shelly device itself turn it off after 30 seconds:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-test --on-seconds 30
+```bash
+python scripts/pump_control_loop.py --env-file .env --interval-seconds 15
 ```
 
 ## Decision strategy
 
-The controller now follows a small deterministic flow:
+The controller follows a small deterministic flow:
 
 1. Fail safe to `OFF` when battery SOC is unavailable.
 2. Force `OFF` when generator power is `100 W` or more.
-3. Use today's forecast only to determine demand:
-   - `heating` when the daily low is `<= 12 C` and the high stays below `26 C`
-   - `cooling` when the daily high is `>= 26 C` and the low stays above `12 C`
-   - `mixed` when the forecast spans both sides of the comfort band
-   - `mild` when the full day stays inside the comfort band
+3. Use the daily weather forecast only to determine demand:
+   - `heating` when the daily low is `<= 12 C`
+   - `cooling` when the daily high is `>= 26 C`
+   - `mixed` when the forecast spans both sides
+   - `mild` when the day stays inside the comfort band
    - `unknown` when forecast min/max is unavailable
-4. If demand exists, use battery hysteresis only:
-   - turn `OFF` at or below `50%` battery
-   - allow `ON` at or above `60%` battery
-   - between `50%` and `60%`, keep the previous automatic state
-   - if there is no previous automatic state in that band, default to `OFF`
-
-The default policy values are:
-
-- Protect a `50%` battery reserve
-- Resume automatic runtime at `60%` battery
-- Treat generator power of `100 W` or more as "generator on"
-- Treat roughly `12 C` to `26 C` as the comfort band
-- Do not use solar production as a decision input
-
-These values live in [policy.py](C:\Users\fkots\visual_studio_code\vrm-solar-automation\src\vrm_solar_automation\policy.py) and are easy to tune once we observe real behavior.
+4. If demand exists, use the configured battery cutoff from `.env`:
+   - turn `OFF` at or below `BATTERY_MIN_SOC_PERCENT`
+   - allow `ON` only when SOC is strictly above `BATTERY_MIN_SOC_PERCENT`
+5. Apply quiet hours after the automatic target is calculated:
+   - if seasonal quiet-hours keys are configured, select the summer or winter window from the local date in `AUTO_CONTROL_TIMEZONE`
+   - otherwise use the legacy year-round `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` window
+   - while quiet hours are active, the pump target is forced `OFF` regardless of SOC
 
 ## State handling
 
-The controller stores the last automatic pump state, the last known Shelly state, and any temporary override in `.state/pump-policy-state.json`. That gives scheduled runs memory for hysteresis, reconciliation, and override release tracking.
+The controller uses a SQLite database (default: `.state/automation.db`) for persistence. It stores:
 
-## API Endpoints
+- current automatic target/runtime state in `controller_state` (single-row table)
+- one historical record per `control` cycle in `control_cycle`
 
-The FastAPI backend is intended to sit beside a frontend on the same Raspberry Pi. The current minimal API includes:
+`control_cycle` rows include:
 
-- `GET /api/health`: simple health check plus control-loop and telemetry summary
-- `GET /api/status`: latest cached controller status, including live telemetry metadata, current override state, automatic-loop status, and Shelly reachability/status
-- `GET /api/events`: server-sent event stream of cached `status_update` payloads for the frontend
-- `GET /api/plug/status`: direct Shelly switch status lookup
-- `POST /api/control/run`: manually run the full control loop and reconcile the plug for maintenance or debugging
-- `GET /api/override`: read the current temporary override
-- `POST /api/override/on`: set a timed manual-on override
-- `POST /api/override/off`: set a timed manual-off override
-- `POST /api/override/off-until-auto-on`: keep the pump off until the next fresh automatic ON signal
-- `POST /api/override/emergency-off`: hold the pump off until automatic control is manually restored
-- `DELETE /api/override`: clear the override and return to automatic mode
+- Cerbo GX metrics (battery, solar, house, generator, active source, phase values)
+- weather snapshot used for policy evaluation
+- policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`)
+- intended target and quiet-hours block metadata
+- Shelly actuation result (`status`, command, observed before/after, error)
 
-Example timed override request body:
+The runtime state still lets one-shot scheduling tolerate manual Shelly changes without introducing a separate override system. It also persists whether the previous cycle was quiet-hours-forced so a one-shot scheduler can turn the plug back on correctly when the quiet-hours window ends.
 
-```json
-{
-  "minutes": 60
-}
+## Database operations
+
+Initial setup:
+
+```bash
+python -m vrm_solar_automation db-upgrade
 ```
 
-`GET /api/status` and `GET /api/events` now include a top-level `telemetry` object with:
+Backup:
 
-- `transport`: `mqtt`, `modbus_fallback`, `mock`, or `unavailable`
-- `connected`: whether the active telemetry transport is currently connected
-- `fallback_active`: whether Modbus fallback is currently driving the cache
-- `last_message_at_iso`: most recent telemetry update time
-- `is_stale`: whether the current telemetry source is considered stale
-- `stale_after_seconds`: the stale threshold in seconds
-- `error`: latest transport-level error, if any
-
-`GET /api/health`, `GET /api/status`, `POST /api/control/run`, and SSE `status_update` payloads also include a top-level `runtime` object that reports whether MQTT was requested and whether the current runtime supports it.
-
-## Troubleshooting
-
-- `add_reader()` / `add_writer()` `NotImplementedError` on Windows:
-  Native Windows development does not support the current Cerbo MQTT runtime. Set `CERBO_MQTT_ENABLED=false`, use mock/Modbus on Windows, or run the backend in WSL or on the Raspberry Pi/Linux target.
-- `Cerbo MQTT loop disconnected: Operation timed out`:
-  The runtime started, but the configured MQTT endpoint did not complete a valid broker session. Check the Cerbo MQTT setting, tunnel/port forwarding, and broker authentication.
-- `CERBO_SITE_IDENTIFIER` problems:
-  The value must be the VRM Portal ID. Do not use the friendly site name such as `Alaro`.
-
-## Frontend dashboard
-
-The project now includes a small React dashboard in [`frontend`](C:\Users\fkots\visual_studio_code\vrm-solar-automation\frontend).
-
-- Production flow: run `npm run build` in `frontend`, then start FastAPI and open `http://<host>:8000/`
-- Development flow: run the FastAPI backend on port `8000`, then run `npm run dev` in `frontend`
-
-The dashboard shows:
-
-- battery, solar, house, and generator status
-- controller decision state, remembered state, background-loop health, telemetry transport/freshness, and Shelly reachability
-- identified weather mode plus current/min/max temperature data
-- a sticky emergency-off switch plus manual override controls for timed ON, timed OFF, stay-OFF-until-auto-ON, and clear override
-
-## Next step
-
-The code now includes the full decision-and-actuation loop with a simplified automatic policy. The next tuning step is validating whether the `50%` reserve, `60%` restart threshold, and `12 C` to `26 C` comfort band match real-world behavior in your Alaro system.
-
-## Python usage
-
-```python
-import asyncio
-
-from vrm_solar_automation import ShellyPlugClient, ShellySettings
-
-
-async def main() -> None:
-    client = ShellyPlugClient(
-        ShellySettings(
-            host="192.168.68.90",
-            switch_id=0,
-            username="admin",
-            password="your-shelly-password",
-        )
-    )
-
-    await client.fetch_device_info()
-    await client.turn_on()
-    await client.turn_on_for(600)
-    await client.turn_off_for(30)
-
-
-asyncio.run(main())
+```bash
+cp .state/automation.db .state/automation.db.backup
 ```
 
-`turn_on_for(seconds)` and `turn_off_for(seconds)` use Shelly's on-device `toggle_after` timer. Delayed state reversal is now handled only by the Shelly device rather than by Python sleeping and sending a second command later.
+Useful charting query examples:
 
-## Plug setup checklist
-
-When you are on the same Wi-Fi as the Shelly plug, gather these values:
-
-1. `SHELLY_HOST`: the plug's local IP or hostname. In the Shelly app or cloud UI, open the device settings and look for the device information page where the local IP is shown.
-2. `SHELLY_SWITCH_ID`: for a single smart plug this is almost always `0`.
-3. `SHELLY_USERNAME` and `SHELLY_PASSWORD`: only if you have enabled local web authentication on the device.
-4. `SHELLY_USE_HTTPS`: usually `false` unless you specifically configured HTTPS on the device.
-
-Then update `.env`, verify connectivity with:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-info
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-status
+```sql
+SELECT timestamp_unix_ms, battery_soc_percent, solar_watts, generator_watts, house_watts
+FROM control_cycle
+WHERE timestamp_unix_ms BETWEEN ? AND ?
+ORDER BY timestamp_unix_ms;
 ```
 
-If those work, run the minimal relay test:
-
-```powershell
-.\.venv\Scripts\python.exe -m vrm_solar_automation plug-test --on-seconds 30
+```sql
+SELECT timestamp_unix_ms, actuation_status, actuation_command_sent
+FROM control_cycle
+WHERE actuation_command_sent IS NOT NULL
+ORDER BY timestamp_unix_ms DESC
+LIMIT 200;
 ```

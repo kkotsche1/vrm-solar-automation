@@ -6,24 +6,25 @@ import json
 
 from .client import VrmProbeClient
 from .config import load_settings
+from .db import upgrade_database
 from .shelly import ShellyPlugClient
 from .system import PumpControlSystem
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Query Victron VRM and evaluate the circulation pump policy.",
+        description="Query Cerbo GX data and run the Shelly-backed pump controller.",
     )
     parser.add_argument(
         "--env-file",
         default=".env",
-        help="Path to the environment file containing Victron credentials.",
+        help="Path to the environment file containing controller settings.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
     metrics_parser = subparsers.add_parser(
         "metrics",
-        help="Fetch the current VRM metrics.",
+        help="Fetch the current Cerbo GX metrics.",
     )
     metrics_parser.add_argument(
         "--json",
@@ -33,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     decide_parser = subparsers.add_parser(
         "decide",
-        help="Fetch VRM and weather data, then evaluate the pump policy.",
+        help="Fetch power and weather data, then evaluate the pump policy.",
     )
     decide_parser.add_argument(
         "--json",
@@ -50,67 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the control payload as JSON.",
     )
-
-    override_status_parser = subparsers.add_parser(
-        "override-status",
-        help="Show the currently stored temporary override state.",
-    )
-    override_status_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the override status as JSON.",
-    )
-
-    override_on_parser = subparsers.add_parser(
-        "override-on",
-        help="Force the pump on temporarily.",
-    )
-    override_on_parser.add_argument(
-        "--minutes",
-        type=float,
-        required=True,
-        help="How long the temporary manual-on override should stay active.",
-    )
-    override_on_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the override result as JSON.",
-    )
-
-    override_off_parser = subparsers.add_parser(
-        "override-off",
-        help="Force the pump off temporarily.",
-    )
-    override_off_parser.add_argument(
-        "--minutes",
-        type=float,
-        required=True,
-        help="How long the temporary manual-off override should stay active.",
-    )
-    override_off_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the override result as JSON.",
-    )
-
-    override_cycle_parser = subparsers.add_parser(
-        "override-off-until-auto-on",
-        help="Keep the pump off until the next fresh automatic ON signal.",
-    )
-    override_cycle_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the override result as JSON.",
-    )
-
-    override_clear_parser = subparsers.add_parser(
-        "override-clear",
-        help="Clear the current temporary override and return to automatic control.",
-    )
-    override_clear_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the clear result as JSON.",
+    subparsers.add_parser(
+        "db-upgrade",
+        help="Upgrade database schema to the latest Alembic revision.",
     )
 
     plug_info_parser = subparsers.add_parser(
@@ -204,9 +147,21 @@ async def _run_metrics(env_file: str, as_json: bool) -> int:
         return 0
 
     print(f"Site: {snapshot.site_name} ({snapshot.site_id})")
-    print(f"Battery SOC: {snapshot.battery_soc_percent:.1f}%" if snapshot.battery_soc_percent is not None else "Battery SOC: unavailable")
-    print(f"Solar watts: {snapshot.solar_watts:.0f} W" if snapshot.solar_watts is not None else "Solar watts: unavailable")
-    print(f"House watts: {snapshot.house_watts:.0f} W" if snapshot.house_watts is not None else "House watts: unavailable")
+    print(
+        f"Battery SOC: {snapshot.battery_soc_percent:.1f}%"
+        if snapshot.battery_soc_percent is not None
+        else "Battery SOC: unavailable"
+    )
+    print(
+        f"Solar watts: {snapshot.solar_watts:.0f} W"
+        if snapshot.solar_watts is not None
+        else "Solar watts: unavailable"
+    )
+    print(
+        f"House watts: {snapshot.house_watts:.0f} W"
+        if snapshot.house_watts is not None
+        else "House watts: unavailable"
+    )
     if snapshot.queried_at_unix_ms is not None:
         print(f"Sample timestamp: {snapshot.queried_at_unix_ms} ({snapshot.queried_at_iso})")
     else:
@@ -224,19 +179,20 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
 
     power = payload["power"]
     weather = payload["weather"]
-    override = payload["override"]
     print(f"Decision: {decision.action}")
-    print("Target state: ON" if decision.should_turn_on else "Target state: OFF")
+    print("Automatic target: ON" if decision.should_turn_on else "Automatic target: OFF")
+    print("Plug target: ON" if payload["intended_target_is_on"] else "Plug target: OFF")
     print(f"Why: {decision.reason}")
+    if payload["quiet_hours_blocked"]:
+        print(f"Blocked: {payload['blocked_reason']}")
     print(
-        f"Battery {power['battery_soc_percent']:.1f}% | Solar {power['solar_watts']:.0f} W | House {power['house_watts']:.0f} W"
+        f"Battery {_format_optional_percent(power['battery_soc_percent'])} | "
+        f"Solar {_format_optional_watts(power['solar_watts'])} | "
+        f"House {_format_optional_watts(power['house_watts'])}"
     )
     if power["generator_watts"] is not None:
         print(f"Generator watts: {power['generator_watts']:.0f} W")
     print(f"Weather today: {_format_weather_summary(weather)}")
-    print(f"Effective target: {'ON' if override['effective_target_is_on'] else 'OFF'}")
-    if override["is_active"]:
-        print(f"Override: {_format_override_summary(override)}")
     return 0
 
 
@@ -251,69 +207,38 @@ async def _run_control(env_file: str, as_json: bool) -> int:
     power = payload["power"]
     weather = payload["weather"]
     actuation = payload["actuation"]
-    override = payload["override"]
     print(f"Decision: {decision.action}")
     print("Automatic target: ON" if decision.should_turn_on else "Automatic target: OFF")
+    print("Plug target: ON" if payload["intended_target_is_on"] else "Plug target: OFF")
     print(f"Why: {decision.reason}")
+    if payload["quiet_hours_blocked"]:
+        print(f"Blocked: {payload['blocked_reason']}")
     print(
-        f"Battery {power['battery_soc_percent']:.1f}% | Solar {power['solar_watts']:.0f} W | House {power['house_watts']:.0f} W"
+        f"Battery {_format_optional_percent(power['battery_soc_percent'])} | "
+        f"Solar {_format_optional_watts(power['solar_watts'])} | "
+        f"House {_format_optional_watts(power['house_watts'])}"
     )
     if power["generator_watts"] is not None:
         print(f"Generator watts: {power['generator_watts']:.0f} W")
     print(f"Weather today: {_format_weather_summary(weather)}")
-    print("Effective target: ON" if override["effective_target_is_on"] else "Effective target: OFF")
-    if override["is_active"]:
-        print(f"Override: {_format_override_summary(override)}")
     print(f"Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"Command sent: {actuation['command_sent']}")
     if actuation["observed_after_is_on"] is not None:
-        print("Plug state after control: ON" if actuation["observed_after_is_on"] else "Plug state after control: OFF")
+        print(
+            "Plug state after control: ON"
+            if actuation["observed_after_is_on"]
+            else "Plug state after control: OFF"
+        )
     if actuation["error"]:
         print(f"Actuation error: {actuation['error']}")
     return 0
 
 
-async def _run_override_status(env_file: str, as_json: bool) -> int:
-    payload = PumpControlSystem(load_settings(env_file)).read_override()
-
-    if as_json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return 0
-
-    print(_format_override_summary(payload))
-    return 0
-
-
-async def _run_override_set(
-    env_file: str,
-    *,
-    mode: str,
-    minutes: float | None,
-    as_json: bool,
-) -> int:
-    system = PumpControlSystem(load_settings(env_file))
-    if mode == "on":
-        payload = await system.set_manual_on_override(duration_minutes=float(minutes))
-    elif mode == "off":
-        payload = await system.set_manual_off_override(duration_minutes=float(minutes))
-    elif mode == "off_until_auto_on":
-        payload = await system.set_manual_off_until_next_auto_on_override()
-    else:
-        payload = await system.clear_override()
-
-    if as_json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return 0
-
-    print(f"Override: {_format_override_summary(payload['override'])}")
-    if payload.get("actuation"):
-        actuation = payload["actuation"]
-        print(f"Actuation status: {actuation['status']}")
-        if actuation.get("command_sent"):
-            print(f"Command sent: {actuation['command_sent']}")
-        if actuation.get("error"):
-            print(f"Actuation error: {actuation['error']}")
+def _run_db_upgrade(env_file: str) -> int:
+    settings = load_settings(env_file)
+    upgrade_database(settings.database_url)
+    print(f"Database schema upgraded successfully: {settings.database_url}")
     return 0
 
 
@@ -351,9 +276,21 @@ async def _run_plug_status(env_file: str, switch_id: int | None, as_json: bool) 
     print(f"Switch id: {status.switch_id}")
     print("Output: ON" if status.output else "Output: OFF")
     print(f"Source: {status.source or 'unknown'}")
-    print(f"Power: {status.power_watts:.1f} W" if status.power_watts is not None else "Power: unavailable")
-    print(f"Voltage: {status.voltage_volts:.1f} V" if status.voltage_volts is not None else "Voltage: unavailable")
-    print(f"Current: {status.current_amps:.3f} A" if status.current_amps is not None else "Current: unavailable")
+    print(
+        f"Power: {status.power_watts:.1f} W"
+        if status.power_watts is not None
+        else "Power: unavailable"
+    )
+    print(
+        f"Voltage: {status.voltage_volts:.1f} V"
+        if status.voltage_volts is not None
+        else "Voltage: unavailable"
+    )
+    print(
+        f"Current: {status.current_amps:.3f} A"
+        if status.current_amps is not None
+        else "Current: unavailable"
+    )
     print(
         f"Temperature: {status.temperature_c:.1f} C"
         if status.temperature_c is not None
@@ -418,8 +355,6 @@ async def _run_plug_test(
         normalized_on_seconds,
         switch_id=switch_id,
     )
-    # The off-timer is executed by the Shelly device itself; this wait is only
-    # to verify the final state after the device-side timer should have elapsed.
     await asyncio.sleep(normalized_on_seconds + 1.0)
     after = await client.fetch_switch_status(switch_id=switch_id)
 
@@ -454,20 +389,16 @@ def _format_optional_float(value: object) -> str:
     return f"{float(value):.1f}"
 
 
-def _format_override_summary(override: dict[str, object]) -> str:
-    if not bool(override["is_active"]):
-        return "automatic mode"
+def _format_optional_percent(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.1f}%"
 
-    mode = str(override["mode"])
-    if mode == "manual_on_until":
-        return f"manual ON until {override['until_iso']}"
-    if mode == "manual_off_until":
-        return f"manual OFF until {override['until_iso']}"
-    if mode == "manual_off_until_next_auto_on":
-        if bool(override["seen_auto_off"]):
-            return "manual OFF until the next fresh automatic ON signal"
-        return "manual OFF waiting for an automatic OFF, then the next fresh automatic ON"
-    return mode
+
+def _format_optional_watts(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.0f} W"
 
 
 def main() -> None:
@@ -480,52 +411,8 @@ def main() -> None:
         raise SystemExit(asyncio.run(_run_decision(args.env_file, args.json)))
     if command == "control":
         raise SystemExit(asyncio.run(_run_control(args.env_file, args.json)))
-    if command == "override-status":
-        raise SystemExit(asyncio.run(_run_override_status(args.env_file, args.json)))
-    if command == "override-on":
-        raise SystemExit(
-            asyncio.run(
-                _run_override_set(
-                    args.env_file,
-                    mode="on",
-                    minutes=args.minutes,
-                    as_json=args.json,
-                )
-            )
-        )
-    if command == "override-off":
-        raise SystemExit(
-            asyncio.run(
-                _run_override_set(
-                    args.env_file,
-                    mode="off",
-                    minutes=args.minutes,
-                    as_json=args.json,
-                )
-            )
-        )
-    if command == "override-off-until-auto-on":
-        raise SystemExit(
-            asyncio.run(
-                _run_override_set(
-                    args.env_file,
-                    mode="off_until_auto_on",
-                    minutes=None,
-                    as_json=args.json,
-                )
-            )
-        )
-    if command == "override-clear":
-        raise SystemExit(
-            asyncio.run(
-                _run_override_set(
-                    args.env_file,
-                    mode="clear",
-                    minutes=None,
-                    as_json=args.json,
-                )
-            )
-        )
+    if command == "db-upgrade":
+        raise SystemExit(_run_db_upgrade(args.env_file))
     if command == "plug-info":
         raise SystemExit(asyncio.run(_run_plug_info(args.env_file, args.json)))
     if command == "plug-status":

@@ -1,89 +1,168 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
-from pathlib import Path
 
-from .policy import PumpPolicyState
+from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
+
+from .db import ControlCycleRecord, ControllerStateRecord, create_session_factory
+from .policy import PumpDecision, PumpPolicyState
 
 
 class StateStore:
-    def __init__(self, path: str) -> None:
-        self._path = Path(path)
+    def __init__(self, database_url: str, *, session_factory: sessionmaker | None = None) -> None:
+        self._session_factory = session_factory or create_session_factory(database_url)
 
     def load(self) -> PumpPolicyState | None:
-        if not self._path.exists():
-            return None
-        data = json.loads(self._path.read_text(encoding="utf-8"))
-        return PumpPolicyState(
-            is_on=bool(data["is_on"]),
-            changed_at_iso=str(data["changed_at_iso"]),
-            last_known_plug_is_on=(
-                bool(data["last_known_plug_is_on"])
-                if data.get("last_known_plug_is_on") is not None
-                else None
-            ),
-            last_known_plug_at_iso=(
-                str(data["last_known_plug_at_iso"])
-                if data.get("last_known_plug_at_iso") is not None
-                else None
-            ),
-            last_actuation_error=(
-                str(data["last_actuation_error"])
-                if data.get("last_actuation_error") is not None
-                else None
-            ),
-            last_actuation_at_iso=(
-                str(data["last_actuation_at_iso"])
-                if data.get("last_actuation_at_iso") is not None
-                else None
-            ),
-            override_mode=(
-                str(data["override_mode"])
-                if data.get("override_mode") is not None
-                else None
-            ),
-            override_until_iso=(
-                str(data["override_until_iso"])
-                if data.get("override_until_iso") is not None
-                else None
-            ),
-            override_set_at_iso=(
-                str(data["override_set_at_iso"])
-                if data.get("override_set_at_iso") is not None
-                else None
-            ),
-            override_seen_auto_off=bool(data.get("override_seen_auto_off", False)),
-        )
+        with self._session_factory() as session:
+            row = session.scalar(select(ControllerStateRecord).where(ControllerStateRecord.id == 1))
+            if row is None:
+                return None
+            return PumpPolicyState(
+                is_on=bool(row.is_on),
+                changed_at_iso=row.changed_at_iso,
+                quiet_hours_forced_off=bool(row.quiet_hours_forced_off),
+                last_known_plug_is_on=row.last_known_plug_is_on,
+                last_known_plug_at_iso=row.last_known_plug_at_iso,
+                last_actuation_error=row.last_actuation_error,
+                last_actuation_at_iso=row.last_actuation_at_iso,
+            )
 
     def save(self, state: PumpPolicyState) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(state.to_dict(), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        now_iso = datetime.now(UTC).isoformat()
+        with self._session_factory() as session:
+            row = session.scalar(select(ControllerStateRecord).where(ControllerStateRecord.id == 1))
+            if row is None:
+                row = ControllerStateRecord(
+                    id=1,
+                    is_on=state.is_on,
+                    changed_at_iso=state.changed_at_iso,
+                    quiet_hours_forced_off=state.quiet_hours_forced_off,
+                    last_known_plug_is_on=state.last_known_plug_is_on,
+                    last_known_plug_at_iso=state.last_known_plug_at_iso,
+                    last_actuation_error=state.last_actuation_error,
+                    last_actuation_at_iso=state.last_actuation_at_iso,
+                    updated_at_iso=now_iso,
+                )
+                session.add(row)
+            else:
+                row.is_on = state.is_on
+                row.changed_at_iso = state.changed_at_iso
+                row.quiet_hours_forced_off = state.quiet_hours_forced_off
+                row.last_known_plug_is_on = state.last_known_plug_is_on
+                row.last_known_plug_at_iso = state.last_known_plug_at_iso
+                row.last_actuation_error = state.last_actuation_error
+                row.last_actuation_at_iso = state.last_actuation_at_iso
+                row.updated_at_iso = now_iso
+            session.commit()
+
+    def record_control_cycle(
+        self,
+        *,
+        timestamp_unix_ms: int,
+        timestamp_iso: str,
+        power: dict[str, object],
+        weather: dict[str, object],
+        decision: PumpDecision,
+        intended_target_is_on: bool,
+        quiet_hours_blocked: bool,
+        blocked_reason: str | None,
+        actuation: dict[str, object],
+    ) -> None:
+        with self._session_factory() as session:
+            session.add(
+                ControlCycleRecord(
+                    timestamp_unix_ms=timestamp_unix_ms,
+                    timestamp_iso=timestamp_iso,
+                    site_id=int(power.get("site_id") or 0),
+                    site_name=str(power.get("site_name") or "unknown"),
+                    site_identifier=str(power.get("site_identifier") or "unknown"),
+                    power_queried_at_unix_ms=_optional_int(power.get("queried_at_unix_ms")),
+                    power_queried_at_iso=_optional_str(power.get("queried_at_iso")),
+                    battery_soc_percent=_optional_float(power.get("battery_soc_percent")),
+                    solar_watts=_optional_float(power.get("solar_watts")),
+                    house_watts=_optional_float(power.get("house_watts")),
+                    house_l1_watts=_optional_float(power.get("house_l1_watts")),
+                    house_l2_watts=_optional_float(power.get("house_l2_watts")),
+                    house_l3_watts=_optional_float(power.get("house_l3_watts")),
+                    generator_watts=_optional_float(power.get("generator_watts")),
+                    active_input_source=_optional_int(power.get("active_input_source")),
+                    current_temperature_c=_optional_float(weather.get("current_temperature_c")),
+                    today_min_temperature_c=_optional_float(weather.get("today_min_temperature_c")),
+                    today_max_temperature_c=_optional_float(weather.get("today_max_temperature_c")),
+                    weather_code=_optional_int(weather.get("weather_code")),
+                    queried_timezone=_optional_str(weather.get("queried_timezone")),
+                    should_turn_on=decision.should_turn_on,
+                    decision_action=decision.action,
+                    decision_reason=decision.reason,
+                    decision_weather_mode=decision.weather_mode,
+                    intended_target_is_on=intended_target_is_on,
+                    quiet_hours_blocked=quiet_hours_blocked,
+                    blocked_reason=blocked_reason,
+                    actuation_status=str(actuation.get("status") or "unknown"),
+                    actuation_command_sent=_optional_str(actuation.get("command_sent")),
+                    actuation_observed_before_is_on=_optional_bool(
+                        actuation.get("observed_before_is_on")
+                    ),
+                    actuation_observed_after_is_on=_optional_bool(
+                        actuation.get("observed_after_is_on")
+                    ),
+                    actuation_error=_optional_str(actuation.get("error")),
+                )
+            )
+            session.commit()
 
     @staticmethod
-    def from_decision(previous_state: PumpPolicyState | None, should_turn_on: bool) -> PumpPolicyState:
-        if previous_state and previous_state.is_on == should_turn_on:
+    def from_decision(
+        previous_state: PumpPolicyState | None,
+        should_turn_on: bool,
+        *,
+        quiet_hours_forced_off: bool = False,
+    ) -> PumpPolicyState:
+        if (
+            previous_state
+            and previous_state.is_on == should_turn_on
+            and previous_state.quiet_hours_forced_off == quiet_hours_forced_off
+        ):
             return previous_state
-        last_known_plug_is_on = previous_state.last_known_plug_is_on if previous_state else None
-        last_known_plug_at_iso = previous_state.last_known_plug_at_iso if previous_state else None
-        last_actuation_error = previous_state.last_actuation_error if previous_state else None
-        last_actuation_at_iso = previous_state.last_actuation_at_iso if previous_state else None
-        override_mode = previous_state.override_mode if previous_state else None
-        override_until_iso = previous_state.override_until_iso if previous_state else None
-        override_set_at_iso = previous_state.override_set_at_iso if previous_state else None
-        override_seen_auto_off = previous_state.override_seen_auto_off if previous_state else False
         return PumpPolicyState(
             is_on=should_turn_on,
             changed_at_iso=datetime.now(UTC).isoformat(),
-            last_known_plug_is_on=last_known_plug_is_on,
-            last_known_plug_at_iso=last_known_plug_at_iso,
-            last_actuation_error=last_actuation_error,
-            last_actuation_at_iso=last_actuation_at_iso,
-            override_mode=override_mode,
-            override_until_iso=override_until_iso,
-            override_set_at_iso=override_set_at_iso,
-            override_seen_auto_off=override_seen_auto_off,
+            quiet_hours_forced_off=quiet_hours_forced_off,
+            last_known_plug_is_on=(
+                previous_state.last_known_plug_is_on if previous_state else None
+            ),
+            last_known_plug_at_iso=(
+                previous_state.last_known_plug_at_iso if previous_state else None
+            ),
+            last_actuation_error=(
+                previous_state.last_actuation_error if previous_state else None
+            ),
+            last_actuation_at_iso=(
+                previous_state.last_actuation_at_iso if previous_state else None
+            ),
         )
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _optional_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)

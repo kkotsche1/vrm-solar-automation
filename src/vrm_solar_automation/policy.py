@@ -9,8 +9,7 @@ from .weather import WeatherSnapshot
 
 @dataclass(frozen=True)
 class PumpPolicyConfig:
-    battery_off_below_soc: float = 50.0
-    battery_resume_above_soc: float = 60.0
+    battery_min_soc: float = 45.0
     generator_on_block_watts: float = 100.0
     heating_below_c: float = 12.0
     cooling_above_c: float = 26.0
@@ -20,37 +19,25 @@ class PumpPolicyConfig:
 class PumpPolicyState:
     is_on: bool
     changed_at_iso: str
+    quiet_hours_forced_off: bool = False
     last_known_plug_is_on: bool | None = None
     last_known_plug_at_iso: str | None = None
     last_actuation_error: str | None = None
     last_actuation_at_iso: str | None = None
-    override_mode: str | None = None
-    override_until_iso: str | None = None
-    override_set_at_iso: str | None = None
-    override_seen_auto_off: bool = False
 
     @property
     def changed_at(self) -> datetime:
         return datetime.fromisoformat(self.changed_at_iso)
 
-    @property
-    def override_until(self) -> datetime | None:
-        if self.override_until_iso is None:
-            return None
-        return datetime.fromisoformat(self.override_until_iso)
-
     def to_dict(self) -> dict[str, str | bool | None]:
         return {
             "is_on": self.is_on,
             "changed_at_iso": self.changed_at_iso,
+            "quiet_hours_forced_off": self.quiet_hours_forced_off,
             "last_known_plug_is_on": self.last_known_plug_is_on,
             "last_known_plug_at_iso": self.last_known_plug_at_iso,
             "last_actuation_error": self.last_actuation_error,
             "last_actuation_at_iso": self.last_actuation_at_iso,
-            "override_mode": self.override_mode,
-            "override_until_iso": self.override_until_iso,
-            "override_set_at_iso": self.override_set_at_iso,
-            "override_seen_auto_off": self.override_seen_auto_off,
         }
 
 
@@ -108,16 +95,6 @@ class PumpPolicy:
                 ),
             )
 
-        if battery_soc <= self._config.battery_off_below_soc:
-            return self._decision(
-                target_on=False,
-                previous_state=previous_state,
-                weather_mode=weather_mode,
-                reason=(
-                    f"Battery SOC is {battery_soc:.1f}%, at or below the {self._config.battery_off_below_soc:.1f}% reserve, so the pump should stay off."
-                ),
-            )
-
         if weather_mode == "unknown":
             return self._decision(
                 target_on=False,
@@ -134,34 +111,22 @@ class PumpPolicy:
                 reason="Today's forecast stays inside the comfort band, so automatic demand is off.",
             )
 
-        if battery_soc >= self._config.battery_resume_above_soc:
+        if battery_soc <= self._config.battery_min_soc:
             return self._decision(
-                target_on=True,
+                target_on=False,
                 previous_state=previous_state,
                 weather_mode=weather_mode,
                 reason=(
-                    f"Today's forecast calls for {weather_mode}, and battery SOC is {battery_soc:.1f}%, above the {self._config.battery_resume_above_soc:.1f}% run threshold."
-                ),
-            )
-
-        if previous_state is not None:
-            target_on = previous_state.is_on
-            state_text = "on" if target_on else "off"
-            return self._decision(
-                target_on=target_on,
-                previous_state=previous_state,
-                weather_mode=weather_mode,
-                reason=(
-                    f"Today's forecast calls for {weather_mode}, and battery SOC is {battery_soc:.1f}% between the off and on thresholds, so the previous automatic state stays {state_text}."
+                    f"Today's forecast calls for {weather_mode}, but battery SOC is {battery_soc:.1f}%, at or below the {self._config.battery_min_soc:.1f}% minimum, so the pump should stay off."
                 ),
             )
 
         return self._decision(
-            target_on=False,
+            target_on=True,
             previous_state=previous_state,
             weather_mode=weather_mode,
             reason=(
-                f"Today's forecast calls for {weather_mode}, but battery SOC is {battery_soc:.1f}% and there is no previous automatic state to carry through the 50-60% hysteresis band."
+                f"Today's forecast calls for {weather_mode}, and battery SOC is {battery_soc:.1f}%, above the {self._config.battery_min_soc:.1f}% minimum run threshold."
             ),
         )
 

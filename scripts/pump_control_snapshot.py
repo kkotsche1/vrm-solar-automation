@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 from pathlib import Path
 import sys
 
@@ -13,53 +15,77 @@ from vrm_solar_automation.config import load_settings
 from vrm_solar_automation.system import PumpControlSystem
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run one control cycle for the pump controller.",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to the environment file containing controller settings.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full control payload as JSON.",
+    )
+    return parser
+
+
 async def main() -> None:
-    env_file = Path(".env")
-    settings = load_settings(env_file)
+    args = build_parser().parse_args()
+    settings = load_settings(args.env_file)
     decision, payload = await PumpControlSystem(settings).control()
+
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
 
     power = payload["power"]
     weather = payload["weather"]
     actuation = payload["actuation"]
 
-    print("Victron state")
-    print(f"  Site: {power['site_name']} ({power['site_id']})")
-    print(f"  Battery SOC: {power['battery_soc_percent']:.1f}%")
-    print(f"  Solar watts: {power['solar_watts']:.0f} W")
-    print(f"  House watts: {power['house_watts']:.0f} W")
-    if power["generator_watts"] is not None:
-        print(f"  Generator watts: {power['generator_watts']:.0f} W")
-    print(f"  Sample time: {power['queried_at_iso']}")
-    print()
-    print("Weather inputs")
-    print(f"  Current temperature: {_format_optional_float(weather['current_temperature_c'])} C")
-    print(f"  Today's low: {_format_optional_float(weather['today_min_temperature_c'])} C")
-    print(f"  Today's high: {_format_optional_float(weather['today_max_temperature_c'])} C")
-    print(f"  Weather code: {weather['weather_code']}")
-    print(f"  Timezone: {weather['queried_timezone']}")
-    print()
-    print("Controller decision")
-    print(f"  Action: {decision.action}")
-    print(f"  Target pump state: {'ON' if decision.should_turn_on else 'OFF'}")
-    print(f"  Weather mode: {decision.weather_mode}")
+    print("Pump control cycle")
+    print(f"  Decision: {decision.action}")
+    print(f"  Automatic target: {'ON' if decision.should_turn_on else 'OFF'}")
+    print(f"  Plug target: {'ON' if payload['intended_target_is_on'] else 'OFF'}")
     print(f"  Reason: {decision.reason}")
-    print()
-    print("Shelly reconciliation")
-    print(f"  Status: {actuation['status']}")
+    if payload["quiet_hours_blocked"]:
+        print(f"  Blocked: {payload['blocked_reason']}")
+    print(f"  Battery SOC: {_format_optional_percent(power['battery_soc_percent'])}")
+    print(f"  Solar watts: {_format_optional_watts(power['solar_watts'])}")
+    print(f"  House watts: {_format_optional_watts(power['house_watts'])}")
+    print(f"  Generator watts: {_format_optional_watts(power['generator_watts'])}")
+    print(f"  Weather low/high: {_format_optional_float(weather['today_min_temperature_c'])} C / {_format_optional_float(weather['today_max_temperature_c'])} C")
+    print(f"  Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"  Command sent: {actuation['command_sent']}")
     if actuation["observed_after_is_on"] is not None:
         print(
-            f"  Observed plug state after control: {'ON' if actuation['observed_after_is_on'] else 'OFF'}"
+            "  Plug state after control: ON"
+            if actuation["observed_after_is_on"]
+            else "  Plug state after control: OFF"
         )
     if actuation["error"]:
-        print(f"  Error: {actuation['error']}")
+        print(f"  Actuation error: {actuation['error']}")
 
 
 def _format_optional_float(value: object) -> str:
     if value is None:
         return "unavailable"
     return f"{float(value):.1f}"
+
+
+def _format_optional_percent(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.1f}%"
+
+
+def _format_optional_watts(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.0f} W"
 
 
 if __name__ == "__main__":
