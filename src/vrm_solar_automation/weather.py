@@ -12,6 +12,7 @@ class WeatherSnapshot:
     current_temperature_c: float | None
     today_min_temperature_c: float | None
     today_max_temperature_c: float | None
+    today_sunshine_hours: float | None
     weather_code: int | None
     queried_timezone: str
 
@@ -20,6 +21,7 @@ class WeatherSnapshot:
             "current_temperature_c": self.current_temperature_c,
             "today_min_temperature_c": self.today_min_temperature_c,
             "today_max_temperature_c": self.today_max_temperature_c,
+            "today_sunshine_hours": self.today_sunshine_hours,
             "weather_code": self.weather_code,
             "queried_timezone": self.queried_timezone,
         }
@@ -39,7 +41,7 @@ class OpenMeteoClient:
             "longitude": longitude,
             "timezone": timezone,
             "current": "temperature_2m",
-            "daily": "temperature_2m_min,temperature_2m_max,weather_code",
+            "daily": "temperature_2m_min,temperature_2m_max,weather_code,sunshine_duration",
             "forecast_days": 1,
         }
         async with session.get(FORECAST_URL, params=params) as response:
@@ -53,6 +55,7 @@ class OpenMeteoClient:
             current_temperature_c=_first_item(current.get("temperature_2m")),
             today_min_temperature_c=_first_item(daily.get("temperature_2m_min")),
             today_max_temperature_c=_first_item(daily.get("temperature_2m_max")),
+            today_sunshine_hours=_first_duration_hours(daily.get("sunshine_duration")),
             weather_code=_first_int_item(daily.get("weather_code")),
             queried_timezone=str(data.get("timezone", timezone)),
         )
@@ -76,3 +79,10 @@ def _first_int_item(value: list[int] | int | None) -> int | None:
             return None
         return int(value[0])
     return int(value)
+
+
+def _first_duration_hours(value: list[float] | float | None) -> float | None:
+    seconds = _first_item(value)
+    if seconds is None:
+        return None
+    return seconds / 3600.0

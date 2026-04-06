@@ -12,6 +12,14 @@ Python automation for a Cerbo GX and Shelly-controlled circulation pump. The pro
 - `scripts/pump_control_snapshot.py`: run one controller cycle from a plain Python script for Raspberry Pi scheduling
 - `scripts/pump_control_loop.py`: run controller cycles continuously in a fixed interval loop (default 15 seconds)
 
+Email notifications are sent for:
+
+- Shelly plug state changes initiated by the controller
+- battery SOC dropping below `40%`, `35%`, and `30%`
+- generator power being detected at `100 W` or higher
+
+Battery and generator alerts are latched in the database, so a one-shot scheduler only sends one alert per active condition. The latch resets automatically after battery SOC recovers above the threshold or generator power disappears.
+
 Manual override is no longer stored in the backend. If the plug is changed in the Shelly app, the automation waits for a fresh automatic transition before reasserting the plug state:
 
 - automatic `ON`, manual Shelly `OFF`: wait for automatic `OFF`, then a new automatic `ON`
@@ -22,13 +30,13 @@ Manual override is no longer stored in the backend. If the plug is changed in th
 Create a virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3 -m venv venv
 ```
 
 Install the package:
 
 ```bash
-. .venv/bin/activate
+venv/bin/activate
 python -m pip install -e .
 ```
 
@@ -45,15 +53,10 @@ CERBO_MOCK_ENABLED=false
 WEATHER_LATITUDE=39.707337
 WEATHER_LONGITUDE=2.791675
 WEATHER_TIMEZONE=Europe/Madrid
+SUNSHINE_HOURS_MIN=4.5
 BATTERY_MIN_SOC_PERCENT=45
 AUTO_OFF_START_LOCAL=18:00
 AUTO_RESUME_START_LOCAL=08:00
-SUMMER_START_MONTH_DAY=04-01
-WINTER_START_MONTH_DAY=10-01
-SUMMER_AUTO_OFF_START_LOCAL=18:30
-SUMMER_AUTO_RESUME_START_LOCAL=08:30
-WINTER_AUTO_OFF_START_LOCAL=17:30
-WINTER_AUTO_RESUME_START_LOCAL=09:00
 AUTO_CONTROL_TIMEZONE=Europe/Madrid
 DATABASE_URL=sqlite:///.state/automation.db
 DATABASE_AUTO_MIGRATE=false
@@ -69,16 +72,13 @@ SMTP_GMAIL_APP_PASSWORD=your-gmail-app-password
 SMTP_GMAIL_RECIPIENTS=f.kotschenreuther@yahoo.de,monika_kotschenreuther@yahoo.de,kkotsche1@gmail.com
 ```
 
+`SUNSHINE_HOURS_MIN` configures the minimum daily direct-sunshine forecast required for automatic daytime demand. The controller requests `sunshine_duration` from Open-Meteo, converts it to hours, and only allows automatic demand when the forecast meets or exceeds this threshold. The initial production default for this installation is `4.5`.
+
 `BATTERY_MIN_SOC_PERCENT` configures the single battery cutoff. It must be a numeric percentage between `0` and `100`. Automatic demand may run only when battery SOC is strictly above this value; at or below it, the pump stays off. The recommended starting value for this installation is `45`.
 
-The controller now supports seasonal quiet-hours windows in `AUTO_CONTROL_TIMEZONE`. When the seasonal keys are present, the pump is forced `OFF` throughout the active quiet-hours window, regardless of SOC, and automatic `ON` resumes only after the configured morning time. The recommended schedule for this installation is:
+`AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` define one fixed year-round quiet-hours window in `AUTO_CONTROL_TIMEZONE`. While quiet hours are active, the pump target is forced `OFF` regardless of sunshine hours or battery SOC.
 
-- summer (`SUMMER_START_MONTH_DAY=04-01` until `WINTER_START_MONTH_DAY=10-01`): `18:30` to `08:30`
-- winter (all other dates): `17:30` to `09:00`
-
-`AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` remain available as a legacy year-round fallback when the seasonal keys are omitted.
-
-`DATABASE_URL` points to the SQLAlchemy database connection used for runtime state and historical tracking. `DATABASE_AUTO_MIGRATE=true` can be enabled to run Alembic migrations automatically when the controller starts.
+`DATABASE_URL` points to the SQLAlchemy database connection used for runtime state and historical tracking. `DATABASE_AUTO_MIGRATE=true` can be enabled to run Alembic migrations automatically when the controller starts. For Raspberry Pi timer deployments, enable it or run `python -m vrm_solar_automation db-upgrade` before restarting the timer whenever the schema changes.
 
 ## Commands
 
@@ -161,11 +161,15 @@ Example `systemd` service:
 ```ini
 [Unit]
 Description=VRM Solar Automation control cycle
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
+User=pi
+Group=pi
 WorkingDirectory=/home/pi/vrm-solar-automation
-ExecStart=/home/pi/vrm-solar-automation/.venv/bin/python /home/pi/vrm-solar-automation/scripts/pump_control_snapshot.py --env-file /home/pi/vrm-solar-automation/.env
+ExecStart=/home/pi/vrm-solar-automation/venv/bin/python /home/pi/vrm-solar-automation/scripts/pump_control_snapshot.py --env-file /home/pi/vrm-solar-automation/.env
 ```
 
 Example `systemd` timer:
@@ -177,6 +181,7 @@ Description=Run VRM Solar Automation every 30 seconds
 [Timer]
 OnBootSec=30
 OnUnitActiveSec=30
+AccuracySec=1s
 Unit=vrm-solar-automation.service
 
 [Install]
@@ -184,6 +189,22 @@ WantedBy=timers.target
 ```
 
 You can use `cron` instead if you prefer, but `systemd` timers are a better fit for 30-second scheduling.
+
+Ready-to-copy unit files are included in:
+
+- [deploy/systemd/vrm-solar-automation.service](/home/kotschi123/vrm-solar-automation/deploy/systemd/vrm-solar-automation.service)
+- [deploy/systemd/vrm-solar-automation.timer](/home/kotschi123/vrm-solar-automation/deploy/systemd/vrm-solar-automation.timer)
+
+Install them on the Raspberry Pi with:
+
+```bash
+sudo cp deploy/systemd/vrm-solar-automation.service /etc/systemd/system/
+sudo cp deploy/systemd/vrm-solar-automation.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now vrm-solar-automation.timer
+```
+
+If your Pi user or checkout path differs from `/home/pi/vrm-solar-automation`, edit `User`, `Group`, `WorkingDirectory`, and `ExecStart` in the service file before copying it into `/etc/systemd/system/`.
 
 If you prefer a single long-running process, you can run:
 
@@ -197,18 +218,16 @@ The controller follows a small deterministic flow:
 
 1. Fail safe to `OFF` when battery SOC is unavailable.
 2. Force `OFF` when generator power is `100 W` or more.
-3. Use the daily weather forecast only to determine demand:
-   - `heating` when the daily low is `<= 12 C`
-   - `cooling` when the daily high is `>= 26 C`
-   - `mixed` when the forecast spans both sides
-   - `mild` when the day stays inside the comfort band
-   - `unknown` when forecast min/max is unavailable
+3. Use the daily Open-Meteo sunshine forecast to determine daytime demand:
+   - `sufficient_sun` when `today_sunshine_hours >= SUNSHINE_HOURS_MIN`
+   - `insufficient_sun` when `today_sunshine_hours < SUNSHINE_HOURS_MIN`
+   - `unknown` when sunshine hours are unavailable
+   - when a live weather refresh fails, the one-shot controller reuses the last successful forecast for the same local weather day before falling back to `unknown`
 4. If demand exists, use the configured battery cutoff from `.env`:
    - turn `OFF` at or below `BATTERY_MIN_SOC_PERCENT`
    - allow `ON` only when SOC is strictly above `BATTERY_MIN_SOC_PERCENT`
 5. Apply quiet hours after the automatic target is calculated:
-   - if seasonal quiet-hours keys are configured, select the summer or winter window from the local date in `AUTO_CONTROL_TIMEZONE`
-   - otherwise use the legacy year-round `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` window
+   - use the fixed year-round `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` window in `AUTO_CONTROL_TIMEZONE`
    - while quiet hours are active, the pump target is forced `OFF` regardless of SOC
 
 ## State handling
@@ -221,12 +240,18 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 `control_cycle` rows include:
 
 - Cerbo GX metrics (battery, solar, house, generator, active source, phase values)
-- weather snapshot used for policy evaluation
+- weather snapshot used for policy evaluation, including `today_sunshine_hours`, plus `weather_source` (`live`, `same_day_cache`, or `unavailable`)
 - policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`)
 - intended target and quiet-hours block metadata
 - Shelly actuation result (`status`, command, observed before/after, error)
 
 The runtime state still lets one-shot scheduling tolerate manual Shelly changes without introducing a separate override system. It also persists whether the previous cycle was quiet-hours-forced so a one-shot scheduler can turn the plug back on correctly when the quiet-hours window ends.
+
+The same singleton runtime row also stores the alert latches for the `40%`, `35%`, and `30%` battery warnings plus the generator-running warning.
+
+The same singleton runtime row also caches the last successful weather snapshot for the local weather day. That cache is what prevents transient Open-Meteo failures from causing a same-minute `OFF` followed by `ON` when the next scheduled run succeeds again.
+
+If you instantiate [StateStore](/home/kotschi123/vrm-solar-automation/src/vrm_solar_automation/state.py) directly in scripts or tests, call `close()` when finished or use it as a context manager so its SQLAlchemy engine is disposed cleanly.
 
 ## Database operations
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -22,15 +21,10 @@ class Settings:
     weather_latitude: float = 39.707337
     weather_longitude: float = 2.791675
     weather_timezone: str = "Europe/Madrid"
+    sunshine_hours_min: float = 4.5
     battery_min_soc_percent: float = 45.0
     auto_off_start_local: str = "18:00"
     auto_resume_start_local: str = "08:00"
-    summer_start_month_day: str | None = None
-    winter_start_month_day: str | None = None
-    summer_auto_off_start_local: str | None = None
-    summer_auto_resume_start_local: str | None = None
-    winter_auto_off_start_local: str | None = None
-    winter_auto_resume_start_local: str | None = None
     auto_control_timezone: str = "Europe/Madrid"
     state_file: str = ".state/pump-policy-state.json"
     database_url: str = "sqlite:///.state/automation.db"
@@ -93,12 +87,16 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     site_id = int(site_id_raw) if site_id_raw else None
     weather_timezone = values.get("WEATHER_TIMEZONE", "Europe/Madrid")
     auto_control_timezone = values.get("AUTO_CONTROL_TIMEZONE", weather_timezone)
+    _validate_timezone(weather_timezone, key="WEATHER_TIMEZONE")
     _validate_timezone(auto_control_timezone, key="AUTO_CONTROL_TIMEZONE")
+    sunshine_hours_min = _parse_hours(
+        values.get("SUNSHINE_HOURS_MIN", "4.5"),
+        key="SUNSHINE_HOURS_MIN",
+    )
     battery_min_soc_percent = _parse_percent(
         values.get("BATTERY_MIN_SOC_PERCENT", "45"),
         key="BATTERY_MIN_SOC_PERCENT",
     )
-    seasonal_quiet_hours = _parse_seasonal_quiet_hours(values)
 
     return Settings(
         email=values.get("VICTRON_EMAIL"),
@@ -117,6 +115,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         weather_latitude=float(values.get("WEATHER_LATITUDE", "39.707337")),
         weather_longitude=float(values.get("WEATHER_LONGITUDE", "2.791675")),
         weather_timezone=weather_timezone,
+        sunshine_hours_min=sunshine_hours_min,
         battery_min_soc_percent=battery_min_soc_percent,
         auto_off_start_local=_parse_local_hhmm(
             values.get("AUTO_OFF_START_LOCAL", "18:00"),
@@ -126,12 +125,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             values.get("AUTO_RESUME_START_LOCAL", "08:00"),
             key="AUTO_RESUME_START_LOCAL",
         ),
-        summer_start_month_day=seasonal_quiet_hours["summer_start_month_day"],
-        winter_start_month_day=seasonal_quiet_hours["winter_start_month_day"],
-        summer_auto_off_start_local=seasonal_quiet_hours["summer_auto_off_start_local"],
-        summer_auto_resume_start_local=seasonal_quiet_hours["summer_auto_resume_start_local"],
-        winter_auto_off_start_local=seasonal_quiet_hours["winter_auto_off_start_local"],
-        winter_auto_resume_start_local=seasonal_quiet_hours["winter_auto_resume_start_local"],
         auto_control_timezone=auto_control_timezone,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),
         database_url=values.get("DATABASE_URL", "sqlite:///.state/automation.db"),
@@ -194,21 +187,20 @@ def _parse_percent(value: str, *, key: str) -> float:
     return candidate
 
 
+def _parse_hours(value: str, *, key: str) -> float:
+    try:
+        candidate = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a numeric hour value.") from exc
+    if candidate < 0 or candidate > 24:
+        raise ValueError(f"{key} must be between 0 and 24.")
+    return candidate
+
+
 def _reject_removed_keys(values: dict[str, str]) -> None:
     removed_keys = (
         "BATTERY_OFF_BELOW_SOC_PERCENT",
         "BATTERY_RESUME_ABOVE_SOC_PERCENT",
-    )
-    present = [key for key in removed_keys if key in values]
-    if present:
-        raise ValueError(
-            "Deprecated battery hysteresis settings are no longer supported. Replace "
-            f"{', '.join(present)} with BATTERY_MIN_SOC_PERCENT."
-        )
-
-
-def _parse_seasonal_quiet_hours(values: dict[str, str]) -> dict[str, str | None]:
-    seasonal_keys = (
         "SUMMER_START_MONTH_DAY",
         "WINTER_START_MONTH_DAY",
         "SUMMER_AUTO_OFF_START_LOCAL",
@@ -216,73 +208,19 @@ def _parse_seasonal_quiet_hours(values: dict[str, str]) -> dict[str, str | None]
         "WINTER_AUTO_OFF_START_LOCAL",
         "WINTER_AUTO_RESUME_START_LOCAL",
     )
-    provided = {key: values.get(key) for key in seasonal_keys}
-    if not any(value is not None for value in provided.values()):
-        return {
-            "summer_start_month_day": None,
-            "winter_start_month_day": None,
-            "summer_auto_off_start_local": None,
-            "summer_auto_resume_start_local": None,
-            "winter_auto_off_start_local": None,
-            "winter_auto_resume_start_local": None,
-        }
-
-    missing = [key for key, value in provided.items() if value is None]
-    if missing:
-        missing_list = ", ".join(missing)
+    present = [key for key in removed_keys if key in values]
+    if present:
+        if any(key.startswith(("SUMMER_", "WINTER_")) for key in present):
+            seasonal_keys = ", ".join(sorted(present))
+            raise ValueError(
+                "Seasonal quiet-hours settings are no longer supported. Remove "
+                f"{seasonal_keys} and use AUTO_OFF_START_LOCAL plus "
+                "AUTO_RESUME_START_LOCAL year-round."
+            )
         raise ValueError(
-            "Seasonal quiet-hours configuration requires all seasonal keys when any are "
-            f"set. Missing: {missing_list}."
+            "Deprecated battery hysteresis settings are no longer supported. Replace "
+            f"{', '.join(present)} with BATTERY_MIN_SOC_PERCENT."
         )
-
-    summer_start_month_day = _parse_month_day(
-        provided["SUMMER_START_MONTH_DAY"],
-        key="SUMMER_START_MONTH_DAY",
-    )
-    winter_start_month_day = _parse_month_day(
-        provided["WINTER_START_MONTH_DAY"],
-        key="WINTER_START_MONTH_DAY",
-    )
-    if summer_start_month_day == winter_start_month_day:
-        raise ValueError("SUMMER_START_MONTH_DAY and WINTER_START_MONTH_DAY must differ.")
-
-    return {
-        "summer_start_month_day": summer_start_month_day,
-        "winter_start_month_day": winter_start_month_day,
-        "summer_auto_off_start_local": _parse_local_hhmm(
-            provided["SUMMER_AUTO_OFF_START_LOCAL"],
-            key="SUMMER_AUTO_OFF_START_LOCAL",
-        ),
-        "summer_auto_resume_start_local": _parse_local_hhmm(
-            provided["SUMMER_AUTO_RESUME_START_LOCAL"],
-            key="SUMMER_AUTO_RESUME_START_LOCAL",
-        ),
-        "winter_auto_off_start_local": _parse_local_hhmm(
-            provided["WINTER_AUTO_OFF_START_LOCAL"],
-            key="WINTER_AUTO_OFF_START_LOCAL",
-        ),
-        "winter_auto_resume_start_local": _parse_local_hhmm(
-            provided["WINTER_AUTO_RESUME_START_LOCAL"],
-            key="WINTER_AUTO_RESUME_START_LOCAL",
-        ),
-    }
-
-
-def _parse_month_day(value: str | None, *, key: str) -> str:
-    if value is None:
-        raise ValueError(f"{key} is required.")
-    candidate = value.strip()
-    if len(candidate) != 5 or candidate[2] != "-":
-        raise ValueError(f"{key} must use MM-DD format.")
-    month_raw, day_raw = candidate.split("-", 1)
-    if not (month_raw.isdigit() and day_raw.isdigit()):
-        raise ValueError(f"{key} must use MM-DD format.")
-
-    try:
-        normalized = date(2000, int(month_raw), int(day_raw))
-    except ValueError as exc:
-        raise ValueError(f"{key} must be a valid month-day value.") from exc
-    return f"{normalized.month:02d}-{normalized.day:02d}"
 
 
 def _validate_timezone(value: str, *, key: str) -> None:

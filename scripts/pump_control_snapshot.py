@@ -56,7 +56,8 @@ async def main() -> None:
     print(f"  Solar watts: {_format_optional_watts(power['solar_watts'])}")
     print(f"  House watts: {_format_optional_watts(power['house_watts'])}")
     print(f"  Generator watts: {_format_optional_watts(power['generator_watts'])}")
-    print(f"  Weather low/high: {_format_optional_float(weather['today_min_temperature_c'])} C / {_format_optional_float(weather['today_max_temperature_c'])} C")
+    print(f"  Weather sunshine: {_format_optional_hours(weather['today_sunshine_hours'])}")
+    print(f"  Weather current temp: {_format_optional_float(weather['current_temperature_c'])} C")
     print(f"  Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"  Command sent: {actuation['command_sent']}")
@@ -74,6 +75,12 @@ def _format_optional_float(value: object) -> str:
     if value is None:
         return "unavailable"
     return f"{float(value):.1f}"
+
+
+def _format_optional_hours(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.1f} h"
 
 
 def _format_optional_percent(value: object) -> str:

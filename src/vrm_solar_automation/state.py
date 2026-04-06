@@ -1,17 +1,37 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
-from .db import ControlCycleRecord, ControllerStateRecord, create_session_factory
+from .db import ControlCycleRecord, ControllerStateRecord, create_engine_for_url
 from .policy import PumpDecision, PumpPolicyState
 
 
 class StateStore:
     def __init__(self, database_url: str, *, session_factory: sessionmaker | None = None) -> None:
-        self._session_factory = session_factory or create_session_factory(database_url)
+        self._engine: Engine | None = None
+        if session_factory is None:
+            self._engine = create_engine_for_url(database_url)
+            self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False)
+        else:
+            self._session_factory = session_factory
+
+    def close(self) -> None:
+        if self._engine is not None:
+            self._engine.dispose()
+            self._engine = None
+
+    def __enter__(self) -> "StateStore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        del exc_type, exc, tb
+        self.close()
+        return False
 
     def load(self) -> PumpPolicyState | None:
         with self._session_factory() as session:
@@ -22,6 +42,18 @@ class StateStore:
                 is_on=bool(row.is_on),
                 changed_at_iso=row.changed_at_iso,
                 quiet_hours_forced_off=bool(row.quiet_hours_forced_off),
+                battery_alert_below_40_sent=bool(row.battery_alert_below_40_sent),
+                battery_alert_below_35_sent=bool(row.battery_alert_below_35_sent),
+                battery_alert_below_30_sent=bool(row.battery_alert_below_30_sent),
+                generator_running_alert_sent=bool(row.generator_running_alert_sent),
+                weather_cache_local_date=row.weather_cache_local_date,
+                weather_cache_current_temperature_c=row.weather_cache_current_temperature_c,
+                weather_cache_today_min_temperature_c=row.weather_cache_today_min_temperature_c,
+                weather_cache_today_max_temperature_c=row.weather_cache_today_max_temperature_c,
+                weather_cache_today_sunshine_hours=row.weather_cache_today_sunshine_hours,
+                weather_cache_weather_code=row.weather_cache_weather_code,
+                weather_cache_queried_timezone=row.weather_cache_queried_timezone,
+                weather_cache_cached_at_iso=row.weather_cache_cached_at_iso,
                 last_known_plug_is_on=row.last_known_plug_is_on,
                 last_known_plug_at_iso=row.last_known_plug_at_iso,
                 last_actuation_error=row.last_actuation_error,
@@ -38,6 +70,18 @@ class StateStore:
                     is_on=state.is_on,
                     changed_at_iso=state.changed_at_iso,
                     quiet_hours_forced_off=state.quiet_hours_forced_off,
+                    battery_alert_below_40_sent=state.battery_alert_below_40_sent,
+                    battery_alert_below_35_sent=state.battery_alert_below_35_sent,
+                    battery_alert_below_30_sent=state.battery_alert_below_30_sent,
+                    generator_running_alert_sent=state.generator_running_alert_sent,
+                    weather_cache_local_date=state.weather_cache_local_date,
+                    weather_cache_current_temperature_c=state.weather_cache_current_temperature_c,
+                    weather_cache_today_min_temperature_c=state.weather_cache_today_min_temperature_c,
+                    weather_cache_today_max_temperature_c=state.weather_cache_today_max_temperature_c,
+                    weather_cache_today_sunshine_hours=state.weather_cache_today_sunshine_hours,
+                    weather_cache_weather_code=state.weather_cache_weather_code,
+                    weather_cache_queried_timezone=state.weather_cache_queried_timezone,
+                    weather_cache_cached_at_iso=state.weather_cache_cached_at_iso,
                     last_known_plug_is_on=state.last_known_plug_is_on,
                     last_known_plug_at_iso=state.last_known_plug_at_iso,
                     last_actuation_error=state.last_actuation_error,
@@ -49,6 +93,24 @@ class StateStore:
                 row.is_on = state.is_on
                 row.changed_at_iso = state.changed_at_iso
                 row.quiet_hours_forced_off = state.quiet_hours_forced_off
+                row.battery_alert_below_40_sent = state.battery_alert_below_40_sent
+                row.battery_alert_below_35_sent = state.battery_alert_below_35_sent
+                row.battery_alert_below_30_sent = state.battery_alert_below_30_sent
+                row.generator_running_alert_sent = state.generator_running_alert_sent
+                row.weather_cache_local_date = state.weather_cache_local_date
+                row.weather_cache_current_temperature_c = state.weather_cache_current_temperature_c
+                row.weather_cache_today_min_temperature_c = (
+                    state.weather_cache_today_min_temperature_c
+                )
+                row.weather_cache_today_max_temperature_c = (
+                    state.weather_cache_today_max_temperature_c
+                )
+                row.weather_cache_today_sunshine_hours = (
+                    state.weather_cache_today_sunshine_hours
+                )
+                row.weather_cache_weather_code = state.weather_cache_weather_code
+                row.weather_cache_queried_timezone = state.weather_cache_queried_timezone
+                row.weather_cache_cached_at_iso = state.weather_cache_cached_at_iso
                 row.last_known_plug_is_on = state.last_known_plug_is_on
                 row.last_known_plug_at_iso = state.last_known_plug_at_iso
                 row.last_actuation_error = state.last_actuation_error
@@ -63,6 +125,7 @@ class StateStore:
         timestamp_iso: str,
         power: dict[str, object],
         weather: dict[str, object],
+        weather_source: str,
         decision: PumpDecision,
         intended_target_is_on: bool,
         quiet_hours_blocked: bool,
@@ -90,8 +153,10 @@ class StateStore:
                     current_temperature_c=_optional_float(weather.get("current_temperature_c")),
                     today_min_temperature_c=_optional_float(weather.get("today_min_temperature_c")),
                     today_max_temperature_c=_optional_float(weather.get("today_max_temperature_c")),
+                    today_sunshine_hours=_optional_float(weather.get("today_sunshine_hours")),
                     weather_code=_optional_int(weather.get("weather_code")),
                     queried_timezone=_optional_str(weather.get("queried_timezone")),
+                    weather_source=weather_source,
                     should_turn_on=decision.should_turn_on,
                     decision_action=decision.action,
                     decision_reason=decision.reason,
@@ -125,22 +190,17 @@ class StateStore:
             and previous_state.quiet_hours_forced_off == quiet_hours_forced_off
         ):
             return previous_state
+        if previous_state is not None:
+            return replace(
+                previous_state,
+                is_on=should_turn_on,
+                changed_at_iso=datetime.now(UTC).isoformat(),
+                quiet_hours_forced_off=quiet_hours_forced_off,
+            )
         return PumpPolicyState(
             is_on=should_turn_on,
             changed_at_iso=datetime.now(UTC).isoformat(),
             quiet_hours_forced_off=quiet_hours_forced_off,
-            last_known_plug_is_on=(
-                previous_state.last_known_plug_is_on if previous_state else None
-            ),
-            last_known_plug_at_iso=(
-                previous_state.last_known_plug_at_iso if previous_state else None
-            ),
-            last_actuation_error=(
-                previous_state.last_actuation_error if previous_state else None
-            ),
-            last_actuation_at_iso=(
-                previous_state.last_actuation_at_iso if previous_state else None
-            ),
         )
 
 

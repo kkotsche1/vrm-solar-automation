@@ -119,6 +119,8 @@ class FakeNotifier:
     def __init__(self, *, should_raise: bool = False) -> None:
         self.should_raise = should_raise
         self.calls: list[dict[str, object]] = []
+        self.battery_alert_calls: list[dict[str, object]] = []
+        self.generator_alert_calls: list[dict[str, object]] = []
 
     def send_plug_state_change_email(
         self,
@@ -147,12 +149,44 @@ class FakeNotifier:
         if self.should_raise:
             raise RuntimeError("smtp failed")
 
+    def send_battery_alert_email(
+        self,
+        *,
+        battery_soc_percent: float,
+        crossed_thresholds: tuple[int, ...],
+        at_iso: str,
+    ) -> None:
+        self.battery_alert_calls.append(
+            {
+                "battery_soc_percent": battery_soc_percent,
+                "crossed_thresholds": crossed_thresholds,
+                "at_iso": at_iso,
+            }
+        )
+        if self.should_raise:
+            raise RuntimeError("smtp failed")
+
+    def send_generator_started_email(
+        self,
+        *,
+        generator_watts: float,
+        at_iso: str,
+    ) -> None:
+        self.generator_alert_calls.append(
+            {
+                "generator_watts": generator_watts,
+                "at_iso": at_iso,
+            }
+        )
+        if self.should_raise:
+            raise RuntimeError("smtp failed")
+
 
 class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
     def test_generator_power_blocks_operation(self) -> None:
         decision = PumpPolicy().decide(
             power=_build_power_snapshot(generator_watts=1200.0),
-            weather=_build_heating_weather(),
+            weather=_build_sunny_weather(),
             previous_state=None,
             now=datetime(2026, 1, 10, tzinfo=UTC),
         )
@@ -168,6 +202,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 current_temperature_c=None,
                 today_min_temperature_c=None,
                 today_max_temperature_c=None,
+                today_sunshine_hours=None,
                 weather_code=None,
                 queried_timezone="Europe/Madrid",
             ),
@@ -177,7 +212,19 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(decision.should_turn_on)
         self.assertEqual(decision.weather_mode, "unknown")
-        self.assertIn("automatic control stays off", decision.reason)
+        self.assertIn("sunshine-hours forecast is unavailable", decision.reason)
+
+    def test_insufficient_sun_keeps_operation_off(self) -> None:
+        decision = PumpPolicy().decide(
+            power=_build_power_snapshot(generator_watts=0.0),
+            weather=_build_sunny_weather(today_sunshine_hours=3.5),
+            previous_state=None,
+            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertEqual(decision.weather_mode, "insufficient_sun")
+        self.assertIn("below the 4.5-hour minimum", decision.reason)
 
     def test_soc_at_minimum_keeps_operation_off(self) -> None:
         previous_state = PumpPolicyState(
@@ -186,7 +233,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         )
         decision = PumpPolicy().decide(
             power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=45.0),
-            weather=_build_heating_weather(),
+            weather=_build_sunny_weather(),
             previous_state=previous_state,
             now=datetime(2026, 1, 10, tzinfo=UTC),
         )
@@ -203,7 +250,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=46.0)
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             state_store=FakeStateStore(),
         )
 
@@ -213,13 +260,31 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["next_state"]["is_on"])
         self.assertIn("46.0%, above the 45.0% minimum run threshold", decision.reason)
 
+    async def test_control_uses_configured_sunshine_threshold(self) -> None:
+        system = PumpControlSystem(
+            _test_settings(
+                sunshine_hours_min=6.5,
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=6.0)),
+            state_store=FakeStateStore(),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertFalse(payload["next_state"]["is_on"])
+        self.assertIn("below the 6.5-hour minimum", decision.reason)
+
     async def test_control_applies_shelly_command_when_target_changes(self) -> None:
         state_store = FakeStateStore()
         notifier = FakeNotifier()
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=FakePlugClient(),
             state_store=state_store,
             notifier=notifier,
@@ -228,9 +293,11 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         decision, payload = await system.control()
 
         self.assertTrue(decision.should_turn_on)
+        self.assertEqual(payload["weather_source"], "live")
         self.assertEqual(payload["actuation"]["status"], "reconciled")
         self.assertEqual(payload["actuation"]["command_sent"], "turn_on")
         self.assertTrue(payload["next_state"]["last_known_plug_is_on"])
+        self.assertIsNotNone(payload["next_state"]["weather_cache_local_date"])
         self.assertNotIn("override", payload)
         self.assertEqual(len(notifier.calls), 1)
         self.assertEqual(notifier.calls[0]["command_sent"], "turn_on")
@@ -249,7 +316,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             state_store=state_store,
         )
 
@@ -264,7 +331,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeUnavailableProbeClient(),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             state_store=FakeStateStore(),
         )
 
@@ -284,7 +351,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 cerbo_site_name="Mock Cerbo GX",
                 cerbo_site_identifier="cerbo-mock",
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             state_store=FakeStateStore(),
         )
 
@@ -310,7 +377,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0)
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=FakePlugClient(status_outputs=[False, False]),
             state_store=FakeStateStore(),
             notifier=notifier,
@@ -325,31 +392,27 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(payload["actuation"]["command_sent"])
         self.assertEqual(notifier.calls, [])
 
-    async def test_summer_quiet_hours_force_running_plug_off(self) -> None:
+    async def test_quiet_hours_force_running_plug_off(self) -> None:
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
             is_on=True,
-            changed_at_iso=datetime(2026, 6, 1, 18, 0, tzinfo=UTC).isoformat(),
+            changed_at_iso=datetime(2026, 1, 10, 18, 0, tzinfo=UTC).isoformat(),
             quiet_hours_forced_off=False,
             last_known_plug_is_on=True,
-            last_known_plug_at_iso=datetime(2026, 6, 1, 18, 0, tzinfo=UTC).isoformat(),
+            last_known_plug_at_iso=datetime(2026, 1, 10, 18, 0, tzinfo=UTC).isoformat(),
         )
         system = PumpControlSystem(
             _test_settings(
-                summer_start_month_day="04-01",
-                winter_start_month_day="10-01",
-                summer_auto_off_start_local="18:30",
-                summer_auto_resume_start_local="08:30",
-                winter_auto_off_start_local="17:30",
-                winter_auto_resume_start_local="09:00",
+                auto_off_start_local="18:30",
+                auto_resume_start_local="08:30",
             ),
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0)
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=FakePlugClient(status_outputs=[True, False]),
             state_store=state_store,
-            now_provider=_fixed_now(2026, 6, 1, 18, 31),
+            now_provider=_fixed_now(2026, 1, 10, 18, 31),
         )
 
         decision, payload = await system.control()
@@ -361,31 +424,27 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["actuation"]["command_sent"], "turn_off")
         self.assertTrue(payload["next_state"]["quiet_hours_forced_off"])
 
-    async def test_summer_quiet_hours_resume_turns_plug_back_on(self) -> None:
+    async def test_quiet_hours_resume_turns_plug_back_on(self) -> None:
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
             is_on=True,
-            changed_at_iso=datetime(2026, 6, 1, 18, 0, tzinfo=UTC).isoformat(),
+            changed_at_iso=datetime(2026, 1, 10, 18, 0, tzinfo=UTC).isoformat(),
             quiet_hours_forced_off=True,
             last_known_plug_is_on=False,
-            last_known_plug_at_iso=datetime(2026, 6, 1, 18, 31, tzinfo=UTC).isoformat(),
+            last_known_plug_at_iso=datetime(2026, 1, 10, 18, 31, tzinfo=UTC).isoformat(),
         )
         system = PumpControlSystem(
             _test_settings(
-                summer_start_month_day="04-01",
-                winter_start_month_day="10-01",
-                summer_auto_off_start_local="18:30",
-                summer_auto_resume_start_local="08:30",
-                winter_auto_off_start_local="17:30",
-                winter_auto_resume_start_local="09:00",
+                auto_off_start_local="18:30",
+                auto_resume_start_local="08:30",
             ),
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0)
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=FakePlugClient(status_outputs=[False, True]),
             state_store=state_store,
-            now_provider=_fixed_now(2026, 6, 2, 8, 31),
+            now_provider=_fixed_now(2026, 1, 11, 8, 31),
         )
 
         decision, payload = await system.control()
@@ -397,20 +456,16 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["actuation"]["command_sent"], "turn_on")
         self.assertFalse(payload["next_state"]["quiet_hours_forced_off"])
 
-    async def test_winter_quiet_hours_use_winter_schedule(self) -> None:
+    async def test_quiet_hours_wrap_overnight_with_fixed_schedule(self) -> None:
         system = PumpControlSystem(
             _test_settings(
-                summer_start_month_day="04-01",
-                winter_start_month_day="10-01",
-                summer_auto_off_start_local="18:30",
-                summer_auto_resume_start_local="08:30",
-                winter_auto_off_start_local="17:30",
-                winter_auto_resume_start_local="09:00",
+                auto_off_start_local="17:30",
+                auto_resume_start_local="09:00",
             ),
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0)
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             state_store=FakeStateStore(),
             now_provider=_fixed_now(2026, 1, 10, 18, 0),
         )
@@ -433,7 +488,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=FakePlugClient(status_outputs=[False, False]),
             state_store=state_store,
             notifier=notifier,
@@ -450,7 +505,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=FakePlugClient(),
             state_store=FakeStateStore(),
             notifier=notifier,
@@ -463,6 +518,73 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["actuation"]["command_sent"], "turn_on")
         self.assertIsNone(payload["actuation"]["error"])
         self.assertEqual(len(notifier.calls), 1)
+
+    async def test_generator_alert_is_sent_once_per_running_period(self) -> None:
+        notifier = FakeNotifier()
+        state_store = FakeStateStore()
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                [
+                    _build_power_snapshot(generator_watts=1200.0),
+                    _build_power_snapshot(generator_watts=900.0),
+                    _build_power_snapshot(generator_watts=0.0),
+                    _build_power_snapshot(generator_watts=1500.0),
+                ]
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=state_store,
+            notifier=notifier,
+        )
+
+        await system.control()
+        await system.control()
+        await system.control()
+        _, payload = await system.control()
+
+        self.assertEqual(len(notifier.generator_alert_calls), 2)
+        self.assertEqual(notifier.generator_alert_calls[0]["generator_watts"], 1200.0)
+        self.assertEqual(notifier.generator_alert_calls[1]["generator_watts"], 1500.0)
+        self.assertTrue(payload["next_state"]["generator_running_alert_sent"])
+
+    async def test_battery_alerts_latch_until_soc_recovers(self) -> None:
+        notifier = FakeNotifier()
+        state_store = FakeStateStore()
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                [
+                    _build_power_snapshot(battery_soc_percent=39.0),
+                    _build_power_snapshot(battery_soc_percent=34.0),
+                    _build_power_snapshot(battery_soc_percent=29.0),
+                    _build_power_snapshot(battery_soc_percent=29.0),
+                    _build_power_snapshot(battery_soc_percent=41.0),
+                    _build_power_snapshot(battery_soc_percent=39.0),
+                ]
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=state_store,
+            notifier=notifier,
+        )
+
+        await system.control()
+        await system.control()
+        await system.control()
+        await system.control()
+        recovery_decision, recovery_payload = await system.control()
+        _, final_payload = await system.control()
+
+        self.assertFalse(recovery_decision.should_turn_on)
+        self.assertEqual(
+            [call["crossed_thresholds"] for call in notifier.battery_alert_calls],
+            [(40,), (35,), (30,), (40,)],
+        )
+        self.assertFalse(recovery_payload["next_state"]["battery_alert_below_40_sent"])
+        self.assertFalse(recovery_payload["next_state"]["battery_alert_below_35_sent"])
+        self.assertFalse(recovery_payload["next_state"]["battery_alert_below_30_sent"])
+        self.assertTrue(final_payload["next_state"]["battery_alert_below_40_sent"])
+        self.assertFalse(final_payload["next_state"]["battery_alert_below_35_sent"])
+        self.assertFalse(final_payload["next_state"]["battery_alert_below_30_sent"])
 
     async def test_manual_shelly_off_during_automatic_on_waits_for_next_off_then_on(self) -> None:
         state_store = FakeStateStore()
@@ -482,7 +604,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                     _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
                 ]
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=plug_client,
             state_store=state_store,
         )
@@ -518,7 +640,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                     _build_power_snapshot(generator_watts=0.0, battery_soc_percent=45.0),
                 ]
             ),
-            weather_client=FakeWeatherClient(_build_heating_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=plug_client,
             state_store=state_store,
         )
@@ -540,16 +662,16 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = f"sqlite:///{Path(temp_dir) / 'automation.db'}"
             upgrade_database(database_url)
-            state_store = StateStore(database_url)
-            system = PumpControlSystem(
-                _test_settings(database_url=database_url),
-                probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
-                weather_client=FakeWeatherClient(_build_heating_weather()),
-                plug_client=FakePlugClient(),
-                state_store=state_store,
-            )
+            with StateStore(database_url) as state_store:
+                system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeWeatherClient(_build_sunny_weather()),
+                    plug_client=FakePlugClient(),
+                    state_store=state_store,
+                )
 
-            decision, _ = await system.control()
+                decision, _ = await system.control()
 
             engine = create_engine_for_url(database_url)
             with engine.begin() as connection:
@@ -557,7 +679,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT COUNT(*) FROM controller_state"
                 ).scalar_one()
                 cycle_row = connection.exec_driver_sql(
-                    "SELECT should_turn_on, actuation_status, actuation_command_sent "
+                    "SELECT should_turn_on, actuation_status, actuation_command_sent, weather_source "
                     "FROM control_cycle ORDER BY id DESC LIMIT 1"
                 ).first()
             engine.dispose()
@@ -568,9 +690,10 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cycle_row[0], 1)
         self.assertEqual(cycle_row[1], "reconciled")
         self.assertEqual(cycle_row[2], "turn_on")
+        self.assertEqual(cycle_row[3], "live")
 
     async def test_weather_cache_reuses_daily_snapshot_within_process(self) -> None:
-        weather_client = FakeCountingWeatherClient([_build_heating_weather()])
+        weather_client = FakeCountingWeatherClient([_build_sunny_weather()])
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
@@ -582,6 +705,8 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         _, payload_two = await system.control()
 
         self.assertEqual(weather_client.fetch_count, 1)
+        self.assertEqual(payload_one["weather_source"], "live")
+        self.assertEqual(payload_two["weather_source"], "same_day_cache")
         self.assertEqual(payload_one["weather"], payload_two["weather"])
 
     async def test_weather_fetch_failure_without_cache_returns_unknown_snapshot(self) -> None:
@@ -594,25 +719,130 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         _, payload = await system.control()
 
-        self.assertIsNone(payload["weather"]["today_min_temperature_c"])
-        self.assertIsNone(payload["weather"]["today_max_temperature_c"])
+        self.assertEqual(payload["weather_source"], "unavailable")
+        self.assertIsNone(payload["weather"]["today_sunshine_hours"])
         self.assertIsNone(payload["weather"]["current_temperature_c"])
         self.assertEqual(payload["weather"]["queried_timezone"], "Europe/Madrid")
 
-    async def test_weather_cache_masks_later_same_day_client_failure(self) -> None:
-        weather_client = FakeCountingWeatherClient([_build_heating_weather()], fail_after=1)
-        system = PumpControlSystem(
-            _test_settings(),
-            probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
-            weather_client=weather_client,
-            state_store=FakeStateStore(),
+    async def test_same_day_persisted_weather_cache_masks_cross_process_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite:///{Path(temp_dir) / 'automation.db'}"
+            upgrade_database(database_url)
+            now_provider = _fixed_now(2026, 1, 10, 10, 0)
+
+            with StateStore(database_url) as first_state_store:
+                first_system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeWeatherClient(_build_sunny_weather()),
+                    plug_client=FakePlugClient(status_outputs=[False, True]),
+                    state_store=first_state_store,
+                    now_provider=now_provider,
+                )
+                _, first_payload = await first_system.control()
+
+            with StateStore(database_url) as second_state_store:
+                second_system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeAlwaysFailWeatherClient(),
+                    plug_client=FakePlugClient(status_outputs=[True, True]),
+                    state_store=second_state_store,
+                    now_provider=now_provider,
+                )
+                second_decision, second_payload = await second_system.control()
+                persisted_state = second_state_store.load()
+
+        self.assertEqual(first_payload["weather_source"], "live")
+        self.assertEqual(second_payload["weather_source"], "same_day_cache")
+        self.assertEqual(second_decision.action, "keep_on")
+        self.assertEqual(second_payload["actuation"]["status"], "no_target_change")
+        self.assertIsNone(second_payload["actuation"]["command_sent"])
+        self.assertEqual(second_payload["weather"], first_payload["weather"])
+        self.assertIsNotNone(persisted_state)
+        self.assertEqual(persisted_state.weather_cache_local_date, "2026-01-10")
+
+    async def test_previous_day_persisted_weather_cache_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite:///{Path(temp_dir) / 'automation.db'}"
+            upgrade_database(database_url)
+
+            with StateStore(database_url) as first_state_store:
+                first_system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeWeatherClient(_build_sunny_weather()),
+                    plug_client=FakePlugClient(status_outputs=[False, True]),
+                    state_store=first_state_store,
+                    now_provider=_fixed_now(2026, 1, 10, 10, 0),
+                )
+                await first_system.control()
+
+            with StateStore(database_url) as second_state_store:
+                second_system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeAlwaysFailWeatherClient(),
+                    plug_client=FakePlugClient(status_outputs=[True, False]),
+                    state_store=second_state_store,
+                    now_provider=_fixed_now(2026, 1, 11, 10, 0),
+                )
+                second_decision, second_payload = await second_system.control()
+
+        self.assertEqual(second_payload["weather_source"], "unavailable")
+        self.assertEqual(second_decision.action, "turn_off")
+        self.assertEqual(second_payload["actuation"]["command_sent"], "turn_off")
+
+    async def test_live_weather_refresh_updates_persisted_cache_after_cached_fallback(self) -> None:
+        refreshed_weather = _build_sunny_weather(
+            current_temperature_c=11.0,
+            today_max_temperature_c=20.0,
+            today_sunshine_hours=7.0,
         )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite:///{Path(temp_dir) / 'automation.db'}"
+            upgrade_database(database_url)
+            now_provider = _fixed_now(2026, 1, 10, 10, 0)
 
-        _, payload_one = await system.control()
-        _, payload_two = await system.control()
+            with StateStore(database_url) as first_state_store:
+                first_system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeWeatherClient(_build_sunny_weather()),
+                    plug_client=FakePlugClient(status_outputs=[False, True]),
+                    state_store=first_state_store,
+                    now_provider=now_provider,
+                )
+                await first_system.control()
 
-        self.assertEqual(weather_client.fetch_count, 1)
-        self.assertEqual(payload_one["weather"], payload_two["weather"])
+            with StateStore(database_url) as second_state_store:
+                second_system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeAlwaysFailWeatherClient(),
+                    plug_client=FakePlugClient(status_outputs=[True, True]),
+                    state_store=second_state_store,
+                    now_provider=now_provider,
+                )
+                await second_system.control()
+
+            with StateStore(database_url) as third_state_store:
+                third_system = PumpControlSystem(
+                    _test_settings(database_url=database_url),
+                    probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+                    weather_client=FakeWeatherClient(refreshed_weather),
+                    plug_client=FakePlugClient(status_outputs=[True, True]),
+                    state_store=third_state_store,
+                    now_provider=now_provider,
+                )
+                _, third_payload = await third_system.control()
+                refreshed_state = third_state_store.load()
+
+        self.assertEqual(third_payload["weather_source"], "live")
+        self.assertIsNotNone(refreshed_state)
+        self.assertEqual(refreshed_state.weather_cache_current_temperature_c, 11.0)
+        self.assertEqual(refreshed_state.weather_cache_today_max_temperature_c, 20.0)
+        self.assertEqual(refreshed_state.weather_cache_today_sunshine_hours, 7.0)
 
 
 def _test_settings(**overrides) -> Settings:
@@ -624,15 +854,10 @@ def _test_settings(**overrides) -> Settings:
         "weather_latitude": 39.707337,
         "weather_longitude": 2.791675,
         "weather_timezone": "Europe/Madrid",
+        "sunshine_hours_min": 4.5,
         "battery_min_soc_percent": 45.0,
         "auto_off_start_local": "00:00",
         "auto_resume_start_local": "00:00",
-        "summer_start_month_day": None,
-        "winter_start_month_day": None,
-        "summer_auto_off_start_local": None,
-        "summer_auto_resume_start_local": None,
-        "winter_auto_off_start_local": None,
-        "winter_auto_resume_start_local": None,
         "auto_control_timezone": "UTC",
         "state_file": ".state/test-pump-policy-state.json",
         "database_url": "sqlite:///.state/test-automation.db",
@@ -666,12 +891,20 @@ def _build_power_snapshot(
     )
 
 
-def _build_heating_weather() -> WeatherSnapshot:
+def _build_sunny_weather(
+    *,
+    current_temperature_c: float = 10.0,
+    today_min_temperature_c: float = 8.0,
+    today_max_temperature_c: float = 18.0,
+    today_sunshine_hours: float = 6.0,
+    weather_code: int = 3,
+) -> WeatherSnapshot:
     return WeatherSnapshot(
-        current_temperature_c=10.0,
-        today_min_temperature_c=8.0,
-        today_max_temperature_c=18.0,
-        weather_code=3,
+        current_temperature_c=current_temperature_c,
+        today_min_temperature_c=today_min_temperature_c,
+        today_max_temperature_c=today_max_temperature_c,
+        today_sunshine_hours=today_sunshine_hours,
+        weather_code=weather_code,
         queried_timezone="Europe/Madrid",
     )
 

@@ -377,8 +377,7 @@ async def _run_plug_test(
 
 def _format_weather_summary(weather: dict[str, object]) -> str:
     return (
-        f"low {_format_optional_float(weather['today_min_temperature_c'])} C, "
-        f"high {_format_optional_float(weather['today_max_temperature_c'])} C, "
+        f"sunshine {_format_optional_hours(weather['today_sunshine_hours'])}, "
         f"current {_format_optional_float(weather['current_temperature_c'])} C"
     )
 
@@ -387,6 +386,12 @@ def _format_optional_float(value: object) -> str:
     if value is None:
         return "unavailable"
     return f"{float(value):.1f}"
+
+
+def _format_optional_hours(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.1f} h"
 
 
 def _format_optional_percent(value: object) -> str:

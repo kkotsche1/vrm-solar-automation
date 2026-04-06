@@ -25,25 +25,65 @@ class GmailSmtpNotifier:
         observed_after_is_on: bool | None,
         at_iso: str,
     ) -> None:
+        self._send_email(
+            subject=f"VRM plug state change: {command_sent}",
+            body_lines=(
+                "The VRM pump controller changed plug state.",
+                f"Timestamp: {at_iso}",
+                f"Decision action: {decision_action}",
+                f"Decision reason: {decision_reason}",
+                f"Intended target: {self._format_bool(intended_is_on)}",
+                f"Command: {command_sent}",
+                f"Actuation status: {actuation_status}",
+                f"Observed before: {self._format_bool(observed_before_is_on)}",
+                f"Observed after: {self._format_bool(observed_after_is_on)}",
+            ),
+        )
+
+    def send_battery_alert_email(
+        self,
+        *,
+        battery_soc_percent: float,
+        crossed_thresholds: tuple[int, ...],
+        at_iso: str,
+    ) -> None:
+        thresholds_text = ", ".join(f"{threshold}%" for threshold in crossed_thresholds)
+        self._send_email(
+            subject=f"VRM battery alert: {battery_soc_percent:.1f}% SOC",
+            body_lines=(
+                "The VRM battery SOC dropped below the configured alert threshold.",
+                f"Timestamp: {at_iso}",
+                f"Battery SOC: {battery_soc_percent:.1f}%",
+                f"Thresholds crossed this run: {thresholds_text}",
+            ),
+        )
+
+    def send_generator_started_email(
+        self,
+        *,
+        generator_watts: float,
+        at_iso: str,
+    ) -> None:
+        self._send_email(
+            subject=f"VRM generator alert: {generator_watts:.0f} W detected",
+            body_lines=(
+                "The VRM controller detected generator power.",
+                f"Timestamp: {at_iso}",
+                f"Generator power: {generator_watts:.0f} W",
+            ),
+        )
+
+    def _send_email(
+        self,
+        *,
+        subject: str,
+        body_lines: tuple[str, ...],
+    ) -> None:
         message = EmailMessage()
         message["From"] = self.sender
         message["To"] = ", ".join(self.recipients)
-        message["Subject"] = f"VRM plug state change: {command_sent}"
-        message.set_content(
-            "\n".join(
-                (
-                    "The VRM pump controller changed plug state.",
-                    f"Timestamp: {at_iso}",
-                    f"Decision action: {decision_action}",
-                    f"Decision reason: {decision_reason}",
-                    f"Intended target: {self._format_bool(intended_is_on)}",
-                    f"Command: {command_sent}",
-                    f"Actuation status: {actuation_status}",
-                    f"Observed before: {self._format_bool(observed_before_is_on)}",
-                    f"Observed after: {self._format_bool(observed_after_is_on)}",
-                )
-            )
-        )
+        message["Subject"] = subject
+        message.set_content("\n".join(body_lines))
 
         with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as smtp:
             smtp.starttls()

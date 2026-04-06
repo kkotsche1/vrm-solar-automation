@@ -13,3 +13,5 @@ frontend/.npm-cache/
 
 .venv-wsl/
 .venv-wsl
+
+*.db

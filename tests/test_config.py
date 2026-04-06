@@ -45,19 +45,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.auto_off_start_local, "18:00")
         self.assertEqual(settings.auto_resume_start_local, "08:00")
 
-    def test_load_settings_parses_soc_and_seasonal_quiet_hours(self) -> None:
+    def test_load_settings_parses_soc_and_sunshine_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
                 "\n".join(
                     [
+                        "SUNSHINE_HOURS_MIN=4.5",
                         "BATTERY_MIN_SOC_PERCENT=45",
-                        "SUMMER_START_MONTH_DAY=04-01",
-                        "WINTER_START_MONTH_DAY=10-01",
-                        "SUMMER_AUTO_OFF_START_LOCAL=18:30",
-                        "SUMMER_AUTO_RESUME_START_LOCAL=08:30",
-                        "WINTER_AUTO_OFF_START_LOCAL=17:30",
-                        "WINTER_AUTO_RESUME_START_LOCAL=09:00",
                     ]
                 )
                 + "\n",
@@ -66,13 +61,16 @@ class ConfigTests(unittest.TestCase):
 
             settings = load_settings(env_path)
 
+        self.assertEqual(settings.sunshine_hours_min, 4.5)
         self.assertEqual(settings.battery_min_soc_percent, 45.0)
-        self.assertEqual(settings.summer_start_month_day, "04-01")
-        self.assertEqual(settings.winter_start_month_day, "10-01")
-        self.assertEqual(settings.summer_auto_off_start_local, "18:30")
-        self.assertEqual(settings.summer_auto_resume_start_local, "08:30")
-        self.assertEqual(settings.winter_auto_off_start_local, "17:30")
-        self.assertEqual(settings.winter_auto_resume_start_local, "09:00")
+
+    def test_load_settings_rejects_invalid_sunshine_hours_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("SUNSHINE_HOURS_MIN=25\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                load_settings(env_path)
 
     def test_load_settings_rejects_invalid_soc_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,30 +88,13 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_settings(env_path)
 
-    def test_load_settings_rejects_partial_seasonal_quiet_hours(self) -> None:
+    def test_load_settings_rejects_removed_seasonal_quiet_hours_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
                 "\n".join(
                     [
                         "SUMMER_START_MONTH_DAY=04-01",
-                        "WINTER_START_MONTH_DAY=10-01",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            with self.assertRaises(ValueError):
-                load_settings(env_path)
-
-    def test_load_settings_rejects_invalid_month_day(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            env_path = Path(temp_dir) / ".env"
-            env_path.write_text(
-                "\n".join(
-                    [
-                        "SUMMER_START_MONTH_DAY=13-01",
                         "WINTER_START_MONTH_DAY=10-01",
                         "SUMMER_AUTO_OFF_START_LOCAL=18:30",
                         "SUMMER_AUTO_RESUME_START_LOCAL=08:30",

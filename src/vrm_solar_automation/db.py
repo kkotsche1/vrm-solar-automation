@@ -20,6 +20,26 @@ class ControllerStateRecord(Base):
     is_on: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
     changed_at_iso: Mapped[str] = mapped_column(String(40), nullable=False)
     quiet_hours_forced_off: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
+    battery_alert_below_40_sent: Mapped[bool] = mapped_column(
+        BOOLEAN, nullable=False, default=False
+    )
+    battery_alert_below_35_sent: Mapped[bool] = mapped_column(
+        BOOLEAN, nullable=False, default=False
+    )
+    battery_alert_below_30_sent: Mapped[bool] = mapped_column(
+        BOOLEAN, nullable=False, default=False
+    )
+    generator_running_alert_sent: Mapped[bool] = mapped_column(
+        BOOLEAN, nullable=False, default=False
+    )
+    weather_cache_local_date: Mapped[str | None] = mapped_column(String(10))
+    weather_cache_current_temperature_c: Mapped[float | None] = mapped_column(FLOAT)
+    weather_cache_today_min_temperature_c: Mapped[float | None] = mapped_column(FLOAT)
+    weather_cache_today_max_temperature_c: Mapped[float | None] = mapped_column(FLOAT)
+    weather_cache_today_sunshine_hours: Mapped[float | None] = mapped_column(FLOAT)
+    weather_cache_weather_code: Mapped[int | None] = mapped_column(INTEGER)
+    weather_cache_queried_timezone: Mapped[str | None] = mapped_column(String(128))
+    weather_cache_cached_at_iso: Mapped[str | None] = mapped_column(String(40))
     last_known_plug_is_on: Mapped[bool | None] = mapped_column(BOOLEAN)
     last_known_plug_at_iso: Mapped[str | None] = mapped_column(String(40))
     last_actuation_error: Mapped[str | None] = mapped_column(TEXT)
@@ -52,8 +72,10 @@ class ControlCycleRecord(Base):
     current_temperature_c: Mapped[float | None] = mapped_column(FLOAT)
     today_min_temperature_c: Mapped[float | None] = mapped_column(FLOAT)
     today_max_temperature_c: Mapped[float | None] = mapped_column(FLOAT)
+    today_sunshine_hours: Mapped[float | None] = mapped_column(FLOAT)
     weather_code: Mapped[int | None] = mapped_column(INTEGER)
     queried_timezone: Mapped[str | None] = mapped_column(String(128))
+    weather_source: Mapped[str] = mapped_column(String(32), nullable=False)
 
     should_turn_on: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
     decision_action: Mapped[str] = mapped_column(String(32), nullable=False)

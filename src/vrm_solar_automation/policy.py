@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 from .models import PowerSnapshot
 from .weather import WeatherSnapshot
@@ -10,9 +10,8 @@ from .weather import WeatherSnapshot
 @dataclass(frozen=True)
 class PumpPolicyConfig:
     battery_min_soc: float = 45.0
+    sunshine_hours_min: float = 4.5
     generator_on_block_watts: float = 100.0
-    heating_below_c: float = 12.0
-    cooling_above_c: float = 26.0
 
 
 @dataclass(frozen=True)
@@ -20,6 +19,18 @@ class PumpPolicyState:
     is_on: bool
     changed_at_iso: str
     quiet_hours_forced_off: bool = False
+    battery_alert_below_40_sent: bool = False
+    battery_alert_below_35_sent: bool = False
+    battery_alert_below_30_sent: bool = False
+    generator_running_alert_sent: bool = False
+    weather_cache_local_date: str | None = None
+    weather_cache_current_temperature_c: float | None = None
+    weather_cache_today_min_temperature_c: float | None = None
+    weather_cache_today_max_temperature_c: float | None = None
+    weather_cache_today_sunshine_hours: float | None = None
+    weather_cache_weather_code: int | None = None
+    weather_cache_queried_timezone: str | None = None
+    weather_cache_cached_at_iso: str | None = None
     last_known_plug_is_on: bool | None = None
     last_known_plug_at_iso: str | None = None
     last_actuation_error: str | None = None
@@ -29,11 +40,37 @@ class PumpPolicyState:
     def changed_at(self) -> datetime:
         return datetime.fromisoformat(self.changed_at_iso)
 
-    def to_dict(self) -> dict[str, str | bool | None]:
+    def cached_weather_for_local_date(self, *, local_date: date) -> WeatherSnapshot | None:
+        if self.weather_cache_local_date != local_date.isoformat():
+            return None
+        if self.weather_cache_queried_timezone is None:
+            return None
+        return WeatherSnapshot(
+            current_temperature_c=self.weather_cache_current_temperature_c,
+            today_min_temperature_c=self.weather_cache_today_min_temperature_c,
+            today_max_temperature_c=self.weather_cache_today_max_temperature_c,
+            today_sunshine_hours=self.weather_cache_today_sunshine_hours,
+            weather_code=self.weather_cache_weather_code,
+            queried_timezone=self.weather_cache_queried_timezone,
+        )
+
+    def to_dict(self) -> dict[str, str | bool | float | int | None]:
         return {
             "is_on": self.is_on,
             "changed_at_iso": self.changed_at_iso,
             "quiet_hours_forced_off": self.quiet_hours_forced_off,
+            "battery_alert_below_40_sent": self.battery_alert_below_40_sent,
+            "battery_alert_below_35_sent": self.battery_alert_below_35_sent,
+            "battery_alert_below_30_sent": self.battery_alert_below_30_sent,
+            "generator_running_alert_sent": self.generator_running_alert_sent,
+            "weather_cache_local_date": self.weather_cache_local_date,
+            "weather_cache_current_temperature_c": self.weather_cache_current_temperature_c,
+            "weather_cache_today_min_temperature_c": self.weather_cache_today_min_temperature_c,
+            "weather_cache_today_max_temperature_c": self.weather_cache_today_max_temperature_c,
+            "weather_cache_today_sunshine_hours": self.weather_cache_today_sunshine_hours,
+            "weather_cache_weather_code": self.weather_cache_weather_code,
+            "weather_cache_queried_timezone": self.weather_cache_queried_timezone,
+            "weather_cache_cached_at_iso": self.weather_cache_cached_at_iso,
             "last_known_plug_is_on": self.last_known_plug_is_on,
             "last_known_plug_at_iso": self.last_known_plug_at_iso,
             "last_actuation_error": self.last_actuation_error,
@@ -100,15 +137,18 @@ class PumpPolicy:
                 target_on=False,
                 previous_state=previous_state,
                 weather_mode=weather_mode,
-                reason="Forecast min/max temperatures are unavailable, so automatic control stays off.",
+                reason="Today's sunshine-hours forecast is unavailable, so automatic control stays off.",
             )
 
-        if weather_mode == "mild":
+        if weather_mode == "insufficient_sun":
             return self._decision(
                 target_on=False,
                 previous_state=previous_state,
                 weather_mode=weather_mode,
-                reason="Today's forecast stays inside the comfort band, so automatic demand is off.",
+                reason=(
+                    f"Today's sunshine forecast is {weather.today_sunshine_hours:.1f} hours, below the "
+                    f"{self._config.sunshine_hours_min:.1f}-hour minimum, so automatic demand is off."
+                ),
             )
 
         if battery_soc <= self._config.battery_min_soc:
@@ -117,7 +157,9 @@ class PumpPolicy:
                 previous_state=previous_state,
                 weather_mode=weather_mode,
                 reason=(
-                    f"Today's forecast calls for {weather_mode}, but battery SOC is {battery_soc:.1f}%, at or below the {self._config.battery_min_soc:.1f}% minimum, so the pump should stay off."
+                    f"Today's sunshine forecast is {weather.today_sunshine_hours:.1f} hours, but battery SOC is "
+                    f"{battery_soc:.1f}%, at or below the {self._config.battery_min_soc:.1f}% minimum, so the pump "
+                    "should stay off."
                 ),
             )
 
@@ -126,24 +168,19 @@ class PumpPolicy:
             previous_state=previous_state,
             weather_mode=weather_mode,
             reason=(
-                f"Today's forecast calls for {weather_mode}, and battery SOC is {battery_soc:.1f}%, above the {self._config.battery_min_soc:.1f}% minimum run threshold."
+                f"Today's sunshine forecast is {weather.today_sunshine_hours:.1f} hours, meeting the "
+                f"{self._config.sunshine_hours_min:.1f}-hour minimum, and battery SOC is {battery_soc:.1f}%, above "
+                f"the {self._config.battery_min_soc:.1f}% minimum run threshold."
             ),
         )
 
     def _classify_weather(self, weather: WeatherSnapshot) -> str:
-        low = weather.today_min_temperature_c
-        high = weather.today_max_temperature_c
-        if low is None or high is None:
+        sunshine_hours = weather.today_sunshine_hours
+        if sunshine_hours is None:
             return "unknown"
-        needs_heating = low <= self._config.heating_below_c
-        needs_cooling = high >= self._config.cooling_above_c
-        if needs_heating and needs_cooling:
-            return "mixed"
-        if needs_heating:
-            return "heating"
-        if needs_cooling:
-            return "cooling"
-        return "mild"
+        if sunshine_hours < self._config.sunshine_hours_min:
+            return "insufficient_sun"
+        return "sufficient_sun"
 
     def _decision(
         self,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 import logging
 from typing import Protocol
@@ -33,6 +33,7 @@ class StateRepository(Protocol):
         timestamp_iso: str,
         power: dict[str, object],
         weather: dict[str, object],
+        weather_source: str,
         decision: PumpDecision,
         intended_target_is_on: bool,
         quiet_hours_blocked: bool,
@@ -64,6 +65,12 @@ class TelemetryStatus:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class WeatherFetchResult:
+    snapshot: WeatherSnapshot
+    source: str
+
+
 class PumpControlSystem:
     def __init__(
         self,
@@ -80,11 +87,12 @@ class PumpControlSystem:
         self._settings = settings
         if settings.database_auto_migrate:
             upgrade_database(settings.database_url)
-        self._policy = policy or PumpPolicy(
-            PumpPolicyConfig(
-                battery_min_soc=settings.battery_min_soc_percent,
-            )
+        policy_config = PumpPolicyConfig(
+            battery_min_soc=settings.battery_min_soc_percent,
+            sunshine_hours_min=settings.sunshine_hours_min,
         )
+        self._policy = policy or PumpPolicy(policy_config)
+        self._generator_alert_threshold_watts = policy_config.generator_on_block_watts
         self._weather_client = weather_client or OpenMeteoClient()
         self._probe_client = probe_client or VrmProbeClient(settings)
         self._plug_client = plug_client
@@ -104,16 +112,6 @@ class PumpControlSystem:
         self._now_provider = now_provider or (lambda: datetime.now(UTC))
         self._auto_off_start_minutes = _hhmm_to_minutes(settings.auto_off_start_local)
         self._auto_resume_start_minutes = _hhmm_to_minutes(settings.auto_resume_start_local)
-        self._summer_start_month_day = _month_day_to_tuple(settings.summer_start_month_day)
-        self._winter_start_month_day = _month_day_to_tuple(settings.winter_start_month_day)
-        self._summer_auto_off_start_minutes = _hhmm_to_minutes(settings.summer_auto_off_start_local)
-        self._summer_auto_resume_start_minutes = _hhmm_to_minutes(
-            settings.summer_auto_resume_start_local
-        )
-        self._winter_auto_off_start_minutes = _hhmm_to_minutes(settings.winter_auto_off_start_local)
-        self._winter_auto_resume_start_minutes = _hhmm_to_minutes(
-            settings.winter_auto_resume_start_local
-        )
         self._auto_control_timezone = ZoneInfo(settings.auto_control_timezone)
         self._weather_timezone = ZoneInfo(settings.weather_timezone)
         self._weather_cache_date: date | None = None
@@ -124,8 +122,9 @@ class PumpControlSystem:
         weather = await self._fetch_weather()
         return await self.evaluate_with_inputs(
             power=power,
-            weather=weather,
+            weather=weather.snapshot,
             power_status=power_status,
+            weather_source=weather.source,
         )
 
     async def control(self) -> tuple[PumpDecision, dict[str, object]]:
@@ -133,8 +132,9 @@ class PumpControlSystem:
         weather = await self._fetch_weather()
         return await self.control_with_inputs(
             power=power,
-            weather=weather,
+            weather=weather.snapshot,
             power_status=power_status,
+            weather_source=weather.source,
         )
 
     async def evaluate_with_inputs(
@@ -143,6 +143,7 @@ class PumpControlSystem:
         power: PowerSnapshot,
         weather: WeatherSnapshot,
         power_status: TelemetryStatus,
+        weather_source: str = "live",
     ) -> tuple[PumpDecision, dict[str, object]]:
         decision, previous_state, next_state = self._evaluate_policy_with_inputs(
             power=power,
@@ -165,6 +166,7 @@ class PumpControlSystem:
             intended_is_on=intended_is_on,
             quiet_hours_blocked=quiet_hours_blocked,
             power_status=power_status,
+            weather_source=weather_source,
         )
 
     async def control_with_inputs(
@@ -174,6 +176,7 @@ class PumpControlSystem:
         weather: WeatherSnapshot,
         power_status: TelemetryStatus,
         force_apply: bool = False,
+        weather_source: str = "live",
     ) -> tuple[PumpDecision, dict[str, object]]:
         decision, previous_state, next_state = self._evaluate_policy_with_inputs(
             power=power,
@@ -203,6 +206,15 @@ class PumpControlSystem:
             decision_action=decision.action,
             decision_reason=decision.reason,
         )
+        final_state = self._apply_alert_state(
+            final_state,
+            power=power,
+        )
+        final_state = self._with_weather_cache(
+            final_state,
+            weather=weather,
+            weather_source=weather_source,
+        )
         self._state_store.save(final_state)
 
         payload = self._build_payload(
@@ -214,6 +226,7 @@ class PumpControlSystem:
             intended_is_on=intended_is_on,
             quiet_hours_blocked=quiet_hours_blocked,
             power_status=power_status,
+            weather_source=weather_source,
         )
         payload["actuation"] = actuation.to_dict()
         cycle_timestamp = datetime.now(UTC)
@@ -222,6 +235,7 @@ class PumpControlSystem:
             timestamp_iso=cycle_timestamp.isoformat(),
             power=payload["power"],
             weather=payload["weather"],
+            weather_source=weather_source,
             decision=decision,
             intended_target_is_on=bool(payload["intended_target_is_on"]),
             quiet_hours_blocked=bool(payload["quiet_hours_blocked"]),
@@ -287,15 +301,16 @@ class PumpControlSystem:
                 ),
             )
 
-    async def _fetch_weather(self) -> WeatherSnapshot:
-        today = datetime.now(self._weather_timezone).date()
+    async def _fetch_weather(self) -> WeatherFetchResult:
+        today = self._weather_local_date()
         if self._weather_cache_date == today and self._weather_cache_snapshot is not None:
-            return self._weather_cache_snapshot
+            return WeatherFetchResult(snapshot=self._weather_cache_snapshot, source="same_day_cache")
 
-        weather = WeatherSnapshot(
+        unavailable_weather = WeatherSnapshot(
             current_temperature_c=None,
             today_min_temperature_c=None,
             today_max_temperature_c=None,
+            today_sunshine_hours=None,
             weather_code=None,
             queried_timezone=self._settings.weather_timezone,
         )
@@ -309,9 +324,22 @@ class PumpControlSystem:
                 )
             self._weather_cache_date = today
             self._weather_cache_snapshot = weather
-        except aiohttp.ClientError:
-            pass
-        return weather
+            return WeatherFetchResult(snapshot=weather, source="live")
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            cached_weather = self._load_same_day_weather_cache(today)
+            if cached_weather is not None:
+                self._weather_cache_date = today
+                self._weather_cache_snapshot = cached_weather
+                LOGGER.warning(
+                    "Weather fetch failed; reusing cached same-day forecast: %s",
+                    exc,
+                )
+                return WeatherFetchResult(snapshot=cached_weather, source="same_day_cache")
+            LOGGER.warning(
+                "Weather fetch failed; no usable same-day forecast cache is available: %s",
+                exc,
+            )
+            return WeatherFetchResult(snapshot=unavailable_weather, source="unavailable")
 
     async def _apply_intended_state(
         self,
@@ -452,10 +480,8 @@ class PumpControlSystem:
         mark_actuation: bool,
     ) -> PumpPolicyState:
         now_iso = datetime.now(UTC).isoformat()
-        return PumpPolicyState(
-            is_on=state.is_on,
-            changed_at_iso=state.changed_at_iso,
-            quiet_hours_forced_off=state.quiet_hours_forced_off,
+        return replace(
+            state,
             last_known_plug_is_on=(
                 observed_is_on if observed_is_on is not None else state.last_known_plug_is_on
             ),
@@ -463,10 +489,102 @@ class PumpControlSystem:
                 now_iso if observed_is_on is not None else state.last_known_plug_at_iso
             ),
             last_actuation_error=error,
-            last_actuation_at_iso=(
-                now_iso if mark_actuation else state.last_actuation_at_iso
-            ),
+            last_actuation_at_iso=(now_iso if mark_actuation else state.last_actuation_at_iso),
         )
+
+    def _apply_alert_state(
+        self,
+        state: PumpPolicyState,
+        *,
+        power: PowerSnapshot,
+    ) -> PumpPolicyState:
+        battery_soc = power.battery_soc_percent
+        generator_watts = abs(power.generator_watts or 0.0)
+        crossed_thresholds: list[int] = []
+
+        battery_alert_below_40_sent = self._should_keep_battery_alert(
+            battery_soc=battery_soc,
+            threshold=40,
+            already_sent=state.battery_alert_below_40_sent,
+            crossed_thresholds=crossed_thresholds,
+        )
+        battery_alert_below_35_sent = self._should_keep_battery_alert(
+            battery_soc=battery_soc,
+            threshold=35,
+            already_sent=state.battery_alert_below_35_sent,
+            crossed_thresholds=crossed_thresholds,
+        )
+        battery_alert_below_30_sent = self._should_keep_battery_alert(
+            battery_soc=battery_soc,
+            threshold=30,
+            already_sent=state.battery_alert_below_30_sent,
+            crossed_thresholds=crossed_thresholds,
+        )
+
+        generator_running = generator_watts >= self._generator_alert_threshold_watts
+        generator_running_alert_sent = state.generator_running_alert_sent
+        if generator_running:
+            if not generator_running_alert_sent:
+                self._send_generator_started_alert(generator_watts=generator_watts)
+                generator_running_alert_sent = True
+        else:
+            generator_running_alert_sent = False
+
+        if crossed_thresholds:
+            self._send_battery_alert(
+                battery_soc_percent=battery_soc,
+                crossed_thresholds=tuple(crossed_thresholds),
+            )
+
+        return replace(
+            state,
+            battery_alert_below_40_sent=battery_alert_below_40_sent,
+            battery_alert_below_35_sent=battery_alert_below_35_sent,
+            battery_alert_below_30_sent=battery_alert_below_30_sent,
+            generator_running_alert_sent=generator_running_alert_sent,
+        )
+
+    def _send_battery_alert(
+        self,
+        *,
+        battery_soc_percent: float | None,
+        crossed_thresholds: tuple[int, ...],
+    ) -> None:
+        if self._notifier is None or battery_soc_percent is None:
+            return
+        try:
+            self._notifier.send_battery_alert_email(
+                battery_soc_percent=battery_soc_percent,
+                crossed_thresholds=crossed_thresholds,
+                at_iso=datetime.now(UTC).isoformat(),
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            LOGGER.warning("Failed to send battery alert email: %s", exc)
+
+    def _send_generator_started_alert(self, *, generator_watts: float) -> None:
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.send_generator_started_email(
+                generator_watts=generator_watts,
+                at_iso=datetime.now(UTC).isoformat(),
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            LOGGER.warning("Failed to send generator alert email: %s", exc)
+
+    @staticmethod
+    def _should_keep_battery_alert(
+        *,
+        battery_soc: float | None,
+        threshold: int,
+        already_sent: bool,
+        crossed_thresholds: list[int],
+    ) -> bool:
+        if battery_soc is None or battery_soc > threshold:
+            return False
+        if not already_sent:
+            crossed_thresholds.append(threshold)
+        return True
 
     def _build_payload(
         self,
@@ -479,11 +597,13 @@ class PumpControlSystem:
         intended_is_on: bool,
         quiet_hours_blocked: bool,
         power_status: TelemetryStatus,
+        weather_source: str,
     ) -> dict[str, object]:
         return {
             "power": power,
             "power_status": power_status.to_dict(),
             "weather": weather,
+            "weather_source": weather_source,
             "previous_state": previous_state.to_dict() if previous_state else None,
             "next_state": next_state.to_dict(),
             "decision": decision.to_dict(),
@@ -508,7 +628,8 @@ class PumpControlSystem:
 
     def _is_within_quiet_hours(self) -> bool:
         local_now = self._local_now()
-        off_start, resume_start = self._current_quiet_hours_window(local_now.date())
+        off_start = self._auto_off_start_minutes
+        resume_start = self._auto_resume_start_minutes
         if off_start == resume_start:
             return False
 
@@ -517,31 +638,44 @@ class PumpControlSystem:
             return off_start <= current_minutes < resume_start
         return current_minutes >= off_start or current_minutes < resume_start
 
-    def _current_quiet_hours_window(self, current_date: date) -> tuple[int, int]:
-        if not self._has_seasonal_quiet_hours():
-            return self._auto_off_start_minutes, self._auto_resume_start_minutes
-        if self._is_summer_date(current_date):
-            return self._summer_auto_off_start_minutes, self._summer_auto_resume_start_minutes
-        return self._winter_auto_off_start_minutes, self._winter_auto_resume_start_minutes
-
-    def _has_seasonal_quiet_hours(self) -> bool:
-        return self._summer_start_month_day is not None and self._winter_start_month_day is not None
-
-    def _is_summer_date(self, current_date: date) -> bool:
-        current_month_day = (current_date.month, current_date.day)
-        summer_start = self._summer_start_month_day
-        winter_start = self._winter_start_month_day
-        if summer_start is None or winter_start is None:
-            return False
-        if summer_start < winter_start:
-            return summer_start <= current_month_day < winter_start
-        return current_month_day >= summer_start or current_month_day < winter_start
-
     def _local_now(self) -> datetime:
         now = self._now_provider()
         if now.tzinfo is None:
             raise ValueError("now_provider must return a timezone-aware datetime.")
         return now.astimezone(self._auto_control_timezone)
+
+    def _weather_local_date(self) -> date:
+        now = self._now_provider()
+        if now.tzinfo is None:
+            raise ValueError("now_provider must return a timezone-aware datetime.")
+        return now.astimezone(self._weather_timezone).date()
+
+    def _load_same_day_weather_cache(self, local_date: date) -> WeatherSnapshot | None:
+        state = self._state_store.load()
+        if state is None:
+            return None
+        return state.cached_weather_for_local_date(local_date=local_date)
+
+    def _with_weather_cache(
+        self,
+        state: PumpPolicyState,
+        *,
+        weather: WeatherSnapshot,
+        weather_source: str,
+    ) -> PumpPolicyState:
+        if weather_source != "live":
+            return state
+        return replace(
+            state,
+            weather_cache_local_date=self._weather_local_date().isoformat(),
+            weather_cache_current_temperature_c=weather.current_temperature_c,
+            weather_cache_today_min_temperature_c=weather.today_min_temperature_c,
+            weather_cache_today_max_temperature_c=weather.today_max_temperature_c,
+            weather_cache_today_sunshine_hours=weather.today_sunshine_hours,
+            weather_cache_weather_code=weather.weather_code,
+            weather_cache_queried_timezone=weather.queried_timezone,
+            weather_cache_cached_at_iso=datetime.now(UTC).isoformat(),
+        )
 
     @staticmethod
     def _with_quiet_hours_state(
@@ -551,15 +685,7 @@ class PumpControlSystem:
     ) -> PumpPolicyState:
         if state.quiet_hours_forced_off == quiet_hours_forced_off:
             return state
-        return PumpPolicyState(
-            is_on=state.is_on,
-            changed_at_iso=state.changed_at_iso,
-            quiet_hours_forced_off=quiet_hours_forced_off,
-            last_known_plug_is_on=state.last_known_plug_is_on,
-            last_known_plug_at_iso=state.last_known_plug_at_iso,
-            last_actuation_error=state.last_actuation_error,
-            last_actuation_at_iso=state.last_actuation_at_iso,
-        )
+        return replace(state, quiet_hours_forced_off=quiet_hours_forced_off)
 
 
 def _hhmm_to_minutes(value: str | None) -> int:
@@ -567,10 +693,3 @@ def _hhmm_to_minutes(value: str | None) -> int:
         return 0
     hour_raw, minute_raw = value.split(":", 1)
     return int(hour_raw) * 60 + int(minute_raw)
-
-
-def _month_day_to_tuple(value: str | None) -> tuple[int, int] | None:
-    if value is None:
-        return None
-    month_raw, day_raw = value.split("-", 1)
-    return int(month_raw), int(day_raw)

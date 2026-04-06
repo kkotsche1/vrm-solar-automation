@@ -1,0 +1,11 @@
+[Unit]
+Description=VRM Solar Automation control cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kotschi123
+Group=kotschi123
+WorkingDirectory=/home/kotschi123/vrm-solar-automation
+ExecStart=/home/kotschi123/vrm-solar-automation/venv/bin/python /home/kotschi123/vrm-solar-automation/scripts/pump_control_snapshot.py --env-file /home/kotschi123/vrm-solar-automation/.env
