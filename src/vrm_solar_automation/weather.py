@@ -15,6 +15,7 @@ class WeatherSnapshot:
     today_sunshine_hours: float | None
     weather_code: int | None
     queried_timezone: str
+    tomorrow_sunshine_hours: float | None = None
 
     def to_dict(self) -> dict[str, float | int | str | None]:
         return {
@@ -22,6 +23,7 @@ class WeatherSnapshot:
             "today_min_temperature_c": self.today_min_temperature_c,
             "today_max_temperature_c": self.today_max_temperature_c,
             "today_sunshine_hours": self.today_sunshine_hours,
+            "tomorrow_sunshine_hours": self.tomorrow_sunshine_hours,
             "weather_code": self.weather_code,
             "queried_timezone": self.queried_timezone,
         }
@@ -42,7 +44,7 @@ class OpenMeteoClient:
             "timezone": timezone,
             "current": "temperature_2m",
             "daily": "temperature_2m_min,temperature_2m_max,weather_code,sunshine_duration",
-            "forecast_days": 1,
+            "forecast_days": 2,
         }
         async with session.get(FORECAST_URL, params=params) as response:
             response.raise_for_status()
@@ -58,6 +60,7 @@ class OpenMeteoClient:
             today_sunshine_hours=_first_duration_hours(daily.get("sunshine_duration")),
             weather_code=_first_int_item(daily.get("weather_code")),
             queried_timezone=str(data.get("timezone", timezone)),
+            tomorrow_sunshine_hours=_duration_hours_at(daily.get("sunshine_duration"), index=1),
         )
 
 
@@ -86,3 +89,22 @@ def _first_duration_hours(value: list[float] | float | None) -> float | None:
     if seconds is None:
         return None
     return seconds / 3600.0
+
+
+def _duration_hours_at(value: list[float] | float | None, *, index: int) -> float | None:
+    seconds = _item_at(value, index=index)
+    if seconds is None:
+        return None
+    return seconds / 3600.0
+
+
+def _item_at(value: list[float] | float | None, *, index: int) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if index < 0 or index >= len(value):
+            return None
+        return float(value[index])
+    if index != 0:
+        return None
+    return float(value)

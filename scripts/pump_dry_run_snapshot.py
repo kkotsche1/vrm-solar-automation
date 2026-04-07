@@ -85,6 +85,15 @@ async def main() -> None:
     print(f"  Quiet hours blocked: {'yes' if payload['quiet_hours_blocked'] else 'no'}")
     if payload["blocked_reason"]:
         print(f"  Block reason: {payload['blocked_reason']}")
+    print(f"  Weather tomorrow sunshine: {_format_optional_hours(payload['weather']['tomorrow_sunshine_hours'])}")
+    if payload["night_surplus_mode_active"]:
+        print(
+            f"  Night reserve: {_format_optional_percent(payload['night_required_soc_percent'])}"
+        )
+        print(
+            "  Night reference sunshine: "
+            f"{_format_optional_hours(payload['night_reference_sunshine_hours'])}"
+        )
     print(f"  Decision reason: {decision.reason}")
     print()
     print("If live control ran now")
@@ -120,6 +129,12 @@ def _format_optional_percent(value: object) -> str:
     if value is None:
         return "unavailable"
     return f"{float(value):.1f}%"
+
+
+def _format_optional_hours(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.1f} h"
 
 
 def _format_optional_watts(value: object) -> str:

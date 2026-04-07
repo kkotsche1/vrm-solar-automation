@@ -7,6 +7,7 @@ src/vrm_solar_automation/cli.py
 src/vrm_solar_automation/client.py
 src/vrm_solar_automation/config.py
 src/vrm_solar_automation/db.py
+src/vrm_solar_automation/historical_weather.py
 src/vrm_solar_automation/mock_data.py
 src/vrm_solar_automation/models.py
 src/vrm_solar_automation/notifier.py
@@ -24,5 +25,7 @@ src/vrm_solar_automation.egg-info/top_level.txt
 tests/test_cli.py
 tests/test_config.py
 tests/test_control_system.py
+tests/test_historical_weather.py
 tests/test_shelly.py
 tests/test_state.py
+tests/test_weather.py

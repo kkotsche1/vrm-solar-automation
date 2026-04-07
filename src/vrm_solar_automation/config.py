@@ -21,11 +21,18 @@ class Settings:
     weather_latitude: float = 39.707337
     weather_longitude: float = 2.791675
     weather_timezone: str = "Europe/Madrid"
-    sunshine_hours_min: float = 4.5
-    battery_min_soc_percent: float = 45.0
+    sunshine_hours_min: float = 6.5
+    battery_min_soc_percent: float = 55.0
     auto_off_start_local: str = "18:00"
     auto_resume_start_local: str = "08:00"
     auto_control_timezone: str = "Europe/Madrid"
+    surplus_night_enabled: bool = True
+    surplus_night_base_load_kw: float = 1.5
+    surplus_night_hard_min_soc_percent: float = 25.0
+    surplus_night_buffer_soc_percent: float = 5.0
+    surplus_night_turn_on_margin_soc_percent: float = 10.0
+    surplus_night_turn_off_margin_soc_percent: float = 5.0
+    surplus_night_next_day_sunshine_min: float = 9.0
     state_file: str = ".state/pump-policy-state.json"
     database_url: str = "sqlite:///.state/automation.db"
     database_auto_migrate: bool = False
@@ -90,12 +97,36 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     _validate_timezone(weather_timezone, key="WEATHER_TIMEZONE")
     _validate_timezone(auto_control_timezone, key="AUTO_CONTROL_TIMEZONE")
     sunshine_hours_min = _parse_hours(
-        values.get("SUNSHINE_HOURS_MIN", "4.5"),
+        values.get("SUNSHINE_HOURS_MIN", "6.5"),
         key="SUNSHINE_HOURS_MIN",
     )
     battery_min_soc_percent = _parse_percent(
-        values.get("BATTERY_MIN_SOC_PERCENT", "45"),
+        values.get("BATTERY_MIN_SOC_PERCENT", "55"),
         key="BATTERY_MIN_SOC_PERCENT",
+    )
+    surplus_night_hard_min_soc_percent = _parse_percent(
+        values.get("SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT", "25"),
+        key="SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT",
+    )
+    surplus_night_buffer_soc_percent = _parse_percent(
+        values.get("SURPLUS_NIGHT_BUFFER_SOC_PERCENT", "5"),
+        key="SURPLUS_NIGHT_BUFFER_SOC_PERCENT",
+    )
+    surplus_night_turn_on_margin_soc_percent = _parse_percent(
+        values.get("SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT", "10"),
+        key="SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT",
+    )
+    surplus_night_turn_off_margin_soc_percent = _parse_percent(
+        values.get("SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT", "5"),
+        key="SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT",
+    )
+    surplus_night_next_day_sunshine_min = _parse_hours(
+        values.get("SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN", "9.0"),
+        key="SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN",
+    )
+    surplus_night_base_load_kw = _parse_non_negative_float(
+        values.get("SURPLUS_NIGHT_BASE_LOAD_KW", "1.5"),
+        key="SURPLUS_NIGHT_BASE_LOAD_KW",
     )
 
     return Settings(
@@ -126,6 +157,18 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             key="AUTO_RESUME_START_LOCAL",
         ),
         auto_control_timezone=auto_control_timezone,
+        surplus_night_enabled=values.get("SURPLUS_NIGHT_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        },
+        surplus_night_base_load_kw=surplus_night_base_load_kw,
+        surplus_night_hard_min_soc_percent=surplus_night_hard_min_soc_percent,
+        surplus_night_buffer_soc_percent=surplus_night_buffer_soc_percent,
+        surplus_night_turn_on_margin_soc_percent=surplus_night_turn_on_margin_soc_percent,
+        surplus_night_turn_off_margin_soc_percent=surplus_night_turn_off_margin_soc_percent,
+        surplus_night_next_day_sunshine_min=surplus_night_next_day_sunshine_min,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),
         database_url=values.get("DATABASE_URL", "sqlite:///.state/automation.db"),
         database_auto_migrate=values.get("DATABASE_AUTO_MIGRATE", "false").lower() in {
@@ -194,6 +237,16 @@ def _parse_hours(value: str, *, key: str) -> float:
         raise ValueError(f"{key} must be a numeric hour value.") from exc
     if candidate < 0 or candidate > 24:
         raise ValueError(f"{key} must be between 0 and 24.")
+    return candidate
+
+
+def _parse_non_negative_float(value: str, *, key: str) -> float:
+    try:
+        candidate = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a numeric value.") from exc
+    if candidate < 0:
+        raise ValueError(f"{key} must be greater than or equal to zero.")
     return candidate
 
 

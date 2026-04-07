@@ -57,7 +57,17 @@ async def main() -> None:
     print(f"  House watts: {_format_optional_watts(power['house_watts'])}")
     print(f"  Generator watts: {_format_optional_watts(power['generator_watts'])}")
     print(f"  Weather sunshine: {_format_optional_hours(weather['today_sunshine_hours'])}")
+    print(f"  Tomorrow sunshine: {_format_optional_hours(weather['tomorrow_sunshine_hours'])}")
     print(f"  Weather current temp: {_format_optional_float(weather['current_temperature_c'])} C")
+    if payload["night_surplus_mode_active"]:
+        print(
+            "  Night reserve: "
+            f"{_format_optional_percent(payload['night_required_soc_percent'])}"
+        )
+        print(
+            "  Night reference sunshine: "
+            f"{_format_optional_hours(payload['night_reference_sunshine_hours'])}"
+        )
     print(f"  Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"  Command sent: {actuation['command_sent']}")

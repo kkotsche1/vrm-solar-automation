@@ -17,3 +17,5 @@ frontend/.npm-cache/
 *.db
 *.xlsx
 *.csx
+
+historicals/

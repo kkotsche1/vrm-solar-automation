@@ -31,6 +31,7 @@ class StateStoreTests(unittest.TestCase):
                     weather_cache_today_min_temperature_c=8.0,
                     weather_cache_today_max_temperature_c=17.0,
                     weather_cache_today_sunshine_hours=6.5,
+                    weather_cache_tomorrow_sunshine_hours=9.0,
                     weather_cache_weather_code=3,
                     weather_cache_queried_timezone="Europe/Madrid",
                     weather_cache_cached_at_iso=datetime(2026, 1, 1, 3, tzinfo=UTC).isoformat(),
@@ -73,6 +74,7 @@ class StateStoreTests(unittest.TestCase):
                         "today_min_temperature_c": 8.0,
                         "today_max_temperature_c": 17.0,
                         "today_sunshine_hours": 6.5,
+                        "tomorrow_sunshine_hours": 9.0,
                         "weather_code": 3,
                         "queried_timezone": "Europe/Madrid",
                     },
@@ -83,6 +85,8 @@ class StateStoreTests(unittest.TestCase):
                         reason="test",
                         reasons=["test"],
                         weather_mode="sufficient_sun",
+                        night_required_soc_percent=72.0,
+                        night_surplus_mode_active=True,
                     ),
                     intended_target_is_on=True,
                     quiet_hours_blocked=False,
@@ -99,7 +103,8 @@ class StateStoreTests(unittest.TestCase):
             engine = create_engine_for_url(database_url)
             with engine.begin() as connection:
                 row = connection.exec_driver_sql(
-                    "SELECT site_identifier, decision_action, actuation_status, weather_source "
+                    "SELECT site_identifier, decision_action, actuation_status, weather_source, "
+                    "tomorrow_sunshine_hours, night_required_soc_percent, night_surplus_mode_active "
                     "FROM control_cycle"
                 ).first()
             engine.dispose()
@@ -109,6 +114,9 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(row[1], "turn_on")
         self.assertEqual(row[2], "reconciled")
         self.assertEqual(row[3], "live")
+        self.assertEqual(row[4], 9.0)
+        self.assertEqual(row[5], 72.0)
+        self.assertEqual(row[6], 1)
 
     def test_migration_upgrade_is_idempotent_and_creates_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -140,11 +148,15 @@ class StateStoreTests(unittest.TestCase):
         self.assertIn("weather_cache_today_min_temperature_c", columns)
         self.assertIn("weather_cache_today_max_temperature_c", columns)
         self.assertIn("weather_cache_today_sunshine_hours", columns)
+        self.assertIn("weather_cache_tomorrow_sunshine_hours", columns)
         self.assertIn("weather_cache_weather_code", columns)
         self.assertIn("weather_cache_queried_timezone", columns)
         self.assertIn("weather_cache_cached_at_iso", columns)
         self.assertIn("weather_source", control_cycle_columns)
         self.assertIn("today_sunshine_hours", control_cycle_columns)
+        self.assertIn("tomorrow_sunshine_hours", control_cycle_columns)
+        self.assertIn("night_required_soc_percent", control_cycle_columns)
+        self.assertIn("night_surplus_mode_active", control_cycle_columns)
 
 
 

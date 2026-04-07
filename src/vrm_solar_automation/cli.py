@@ -193,6 +193,13 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
     if power["generator_watts"] is not None:
         print(f"Generator watts: {power['generator_watts']:.0f} W")
     print(f"Weather today: {_format_weather_summary(weather)}")
+    print(f"Weather tomorrow sunshine: {_format_optional_hours(weather['tomorrow_sunshine_hours'])}")
+    if payload["night_surplus_mode_active"]:
+        print(
+            "Night reserve: "
+            f"{_format_optional_percent(payload['night_required_soc_percent'])} | "
+            f"reference sunshine {_format_optional_hours(payload['night_reference_sunshine_hours'])}"
+        )
     return 0
 
 
@@ -221,6 +228,13 @@ async def _run_control(env_file: str, as_json: bool) -> int:
     if power["generator_watts"] is not None:
         print(f"Generator watts: {power['generator_watts']:.0f} W")
     print(f"Weather today: {_format_weather_summary(weather)}")
+    print(f"Weather tomorrow sunshine: {_format_optional_hours(weather['tomorrow_sunshine_hours'])}")
+    if payload["night_surplus_mode_active"]:
+        print(
+            "Night reserve: "
+            f"{_format_optional_percent(payload['night_required_soc_percent'])} | "
+            f"reference sunshine {_format_optional_hours(payload['night_reference_sunshine_hours'])}"
+        )
     print(f"Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"Command sent: {actuation['command_sent']}")

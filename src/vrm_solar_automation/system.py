@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import logging
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -114,6 +114,18 @@ class PumpControlSystem:
         self._auto_resume_start_minutes = _hhmm_to_minutes(settings.auto_resume_start_local)
         self._auto_control_timezone = ZoneInfo(settings.auto_control_timezone)
         self._weather_timezone = ZoneInfo(settings.weather_timezone)
+        self._surplus_night_enabled = settings.surplus_night_enabled
+        self._surplus_night_base_load_kw = settings.surplus_night_base_load_kw
+        self._surplus_night_hard_min_soc_percent = settings.surplus_night_hard_min_soc_percent
+        self._surplus_night_buffer_soc_percent = settings.surplus_night_buffer_soc_percent
+        self._surplus_night_turn_on_margin_soc_percent = (
+            settings.surplus_night_turn_on_margin_soc_percent
+        )
+        self._surplus_night_turn_off_margin_soc_percent = (
+            settings.surplus_night_turn_off_margin_soc_percent
+        )
+        self._surplus_night_next_day_sunshine_min = settings.surplus_night_next_day_sunshine_min
+        self._battery_capacity_kwh = 50.0
         self._weather_cache_date: date | None = None
         self._weather_cache_snapshot: WeatherSnapshot | None = None
 
@@ -145,17 +157,17 @@ class PumpControlSystem:
         power_status: TelemetryStatus,
         weather_source: str = "live",
     ) -> tuple[PumpDecision, dict[str, object]]:
-        decision, previous_state, next_state = self._evaluate_policy_with_inputs(
+        (
+            decision,
+            previous_state,
+            next_state,
+            quiet_hours_forced_off,
+        ) = self._evaluate_policy_with_inputs(
             power=power,
             weather=weather,
         )
-        quiet_hours_active = self._is_within_quiet_hours()
-        next_state = self._with_quiet_hours_state(
-            next_state,
-            quiet_hours_forced_off=quiet_hours_active,
-        )
-        intended_is_on = self._intended_target_is_on(next_state.is_on, quiet_hours_active)
-        quiet_hours_blocked = quiet_hours_active and next_state.is_on
+        intended_is_on = self._intended_target_is_on(next_state.is_on, quiet_hours_forced_off)
+        quiet_hours_blocked = quiet_hours_forced_off and next_state.is_on
 
         return decision, self._build_payload(
             decision=decision,
@@ -178,17 +190,17 @@ class PumpControlSystem:
         force_apply: bool = False,
         weather_source: str = "live",
     ) -> tuple[PumpDecision, dict[str, object]]:
-        decision, previous_state, next_state = self._evaluate_policy_with_inputs(
+        (
+            decision,
+            previous_state,
+            next_state,
+            quiet_hours_forced_off,
+        ) = self._evaluate_policy_with_inputs(
             power=power,
             weather=weather,
         )
-        quiet_hours_active = self._is_within_quiet_hours()
-        next_state = self._with_quiet_hours_state(
-            next_state,
-            quiet_hours_forced_off=quiet_hours_active,
-        )
-        intended_is_on = self._intended_target_is_on(next_state.is_on, quiet_hours_active)
-        quiet_hours_blocked = quiet_hours_active and next_state.is_on
+        intended_is_on = self._intended_target_is_on(next_state.is_on, quiet_hours_forced_off)
+        quiet_hours_blocked = quiet_hours_forced_off and next_state.is_on
         previous_intended_is_on = self._previous_intended_target_is_on(previous_state)
         target_changed = (
             force_apply
@@ -200,7 +212,7 @@ class PumpControlSystem:
         actuation, final_state = await self._apply_intended_state(
             next_state,
             intended_is_on=intended_is_on,
-            quiet_hours_active=quiet_hours_active,
+            quiet_hours_active=quiet_hours_forced_off,
             quiet_hours_blocked=quiet_hours_blocked,
             target_changed=target_changed,
             decision_action=decision.action,
@@ -253,15 +265,32 @@ class PumpControlSystem:
         PumpDecision,
         PumpPolicyState | None,
         PumpPolicyState,
+        bool,
     ]:
         previous_state = self._state_store.load()
+        quiet_hours_forced_off = False
         decision = self._policy.decide(
             power=power,
             weather=weather,
             previous_state=previous_state,
         )
-        next_state = StateStore.from_decision(previous_state, decision.should_turn_on)
-        return decision, previous_state, next_state
+        local_now = self._local_now()
+        if self._is_within_quiet_hours(local_now=local_now):
+            if self._surplus_night_enabled:
+                decision = self._decide_surplus_night(
+                    power=power,
+                    weather=weather,
+                    previous_state=previous_state,
+                    local_now=local_now,
+                )
+            else:
+                quiet_hours_forced_off = True
+        next_state = StateStore.from_decision(
+            previous_state,
+            decision.should_turn_on,
+            quiet_hours_forced_off=quiet_hours_forced_off,
+        )
+        return decision, previous_state, next_state, quiet_hours_forced_off
 
     async def _fetch_power(self) -> tuple[PowerSnapshot, TelemetryStatus]:
         power_source = getattr(self._probe_client, "source", "cerbo_modbus")
@@ -313,6 +342,7 @@ class PumpControlSystem:
             today_sunshine_hours=None,
             weather_code=None,
             queried_timezone=self._settings.weather_timezone,
+            tomorrow_sunshine_hours=None,
         )
         try:
             async with aiohttp.ClientSession() as session:
@@ -586,6 +616,178 @@ class PumpControlSystem:
             crossed_thresholds.append(threshold)
         return True
 
+    def _decide_surplus_night(
+        self,
+        *,
+        power: PowerSnapshot,
+        weather: WeatherSnapshot,
+        previous_state: PumpPolicyState | None,
+        local_now: datetime,
+    ) -> PumpDecision:
+        battery_soc = power.battery_soc_percent
+        generator_watts = abs(power.generator_watts or 0.0)
+        required_soc = self._required_night_soc_percent(local_now=local_now)
+        reference_label, reference_sunshine = self._night_reference_sunshine(
+            weather=weather,
+            local_now=local_now,
+        )
+        turn_on_threshold = required_soc + self._surplus_night_turn_on_margin_soc_percent
+        turn_off_threshold = required_soc + self._surplus_night_turn_off_margin_soc_percent
+        previous_target_is_on = previous_state.is_on if previous_state is not None else False
+
+        if battery_soc is None:
+            return self._night_decision(
+                target_on=False,
+                previous_state=previous_state,
+                required_soc=required_soc,
+                reference_sunshine=reference_sunshine,
+                reason="Battery SOC is unavailable, so reserve-aware night control fails safe to off.",
+            )
+
+        if generator_watts >= self._generator_alert_threshold_watts:
+            return self._night_decision(
+                target_on=False,
+                previous_state=previous_state,
+                required_soc=required_soc,
+                reference_sunshine=reference_sunshine,
+                reason=(
+                    f"Generator power is present at {generator_watts:.0f} W, so reserve-aware night "
+                    "control keeps the pump off."
+                ),
+            )
+
+        if reference_sunshine is None:
+            return self._night_decision(
+                target_on=False,
+                previous_state=previous_state,
+                required_soc=required_soc,
+                reference_sunshine=reference_sunshine,
+                reason=(
+                    f"{reference_label.capitalize()}'s sunshine-hours forecast is unavailable, so "
+                    "reserve-aware night control keeps the pump off."
+                ),
+            )
+
+        if reference_sunshine < self._surplus_night_next_day_sunshine_min:
+            return self._night_decision(
+                target_on=False,
+                previous_state=previous_state,
+                required_soc=required_soc,
+                reference_sunshine=reference_sunshine,
+                reason=(
+                    f"{reference_label.capitalize()}'s sunshine forecast is {reference_sunshine:.1f} hours, "
+                    f"below the {self._surplus_night_next_day_sunshine_min:.1f}-hour surplus-night minimum, "
+                    "so the pump stays off."
+                ),
+            )
+
+        if previous_target_is_on:
+            if battery_soc <= turn_off_threshold:
+                return self._night_decision(
+                    target_on=False,
+                    previous_state=previous_state,
+                    required_soc=required_soc,
+                    reference_sunshine=reference_sunshine,
+                    reason=(
+                        f"Reserve-aware night control needs at least {turn_off_threshold:.1f}% SOC to keep "
+                        f"running, and battery SOC is {battery_soc:.1f}%, so the pump turns off."
+                    ),
+                )
+            return self._night_decision(
+                target_on=True,
+                previous_state=previous_state,
+                required_soc=required_soc,
+                reference_sunshine=reference_sunshine,
+                reason=(
+                    f"Reserve-aware night control stays on because {reference_label}'s sunshine forecast is "
+                    f"{reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, above the "
+                    f"{turn_off_threshold:.1f}% keep-running threshold."
+                ),
+            )
+
+        if battery_soc < turn_on_threshold:
+            return self._night_decision(
+                target_on=False,
+                previous_state=previous_state,
+                required_soc=required_soc,
+                reference_sunshine=reference_sunshine,
+                reason=(
+                    f"Reserve-aware night control needs at least {turn_on_threshold:.1f}% SOC to turn on, "
+                    f"and battery SOC is {battery_soc:.1f}%, so the pump stays off."
+                ),
+            )
+
+        return self._night_decision(
+            target_on=True,
+            previous_state=previous_state,
+            required_soc=required_soc,
+            reference_sunshine=reference_sunshine,
+            reason=(
+                f"Reserve-aware night control can run because {reference_label}'s sunshine forecast is "
+                f"{reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, meeting the "
+                f"{turn_on_threshold:.1f}% turn-on threshold."
+            ),
+        )
+
+    def _night_decision(
+        self,
+        *,
+        target_on: bool,
+        previous_state: PumpPolicyState | None,
+        required_soc: float,
+        reference_sunshine: float | None,
+        reason: str,
+    ) -> PumpDecision:
+        return PumpDecision(
+            should_turn_on=target_on,
+            action=PumpPolicy._action(target_on, previous_state),
+            reason=reason,
+            reasons=[reason],
+            weather_mode="surplus_night",
+            night_required_soc_percent=required_soc,
+            night_reference_sunshine_hours=reference_sunshine,
+            night_surplus_mode_active=True,
+        )
+
+    def _night_reference_sunshine(
+        self,
+        *,
+        weather: WeatherSnapshot,
+        local_now: datetime,
+    ) -> tuple[str, float | None]:
+        current_minutes = (local_now.hour * 60) + local_now.minute
+        if current_minutes >= self._auto_off_start_minutes:
+            return "tomorrow", weather.tomorrow_sunshine_hours
+        return "today", weather.today_sunshine_hours
+
+    def _required_night_soc_percent(self, *, local_now: datetime) -> float:
+        hours_until_resume = self._hours_until_resume(local_now=local_now)
+        reserve_soc = (
+            self._surplus_night_hard_min_soc_percent
+            + self._surplus_night_buffer_soc_percent
+            + ((hours_until_resume * self._surplus_night_base_load_kw) / self._battery_capacity_kwh)
+            * 100.0
+        )
+        return reserve_soc
+
+    def _hours_until_resume(self, *, local_now: datetime) -> float:
+        resume_today = local_now.replace(
+            hour=self._auto_resume_start_minutes // 60,
+            minute=self._auto_resume_start_minutes % 60,
+            second=0,
+            microsecond=0,
+        )
+        if not self._is_within_quiet_hours(local_now=local_now):
+            return 0.0
+        current_minutes = (local_now.hour * 60) + local_now.minute
+        if self._auto_off_start_minutes < self._auto_resume_start_minutes:
+            resume_at = resume_today
+        elif current_minutes >= self._auto_off_start_minutes:
+            resume_at = resume_today + timedelta(days=1)
+        else:
+            resume_at = resume_today
+        return max(0.0, (resume_at - local_now).total_seconds() / 3600.0)
+
     def _build_payload(
         self,
         *,
@@ -610,6 +812,9 @@ class PumpControlSystem:
             "intended_target_is_on": intended_is_on,
             "quiet_hours_blocked": quiet_hours_blocked,
             "blocked_reason": QUIET_HOURS_BLOCK_REASON if quiet_hours_blocked else None,
+            "night_required_soc_percent": decision.night_required_soc_percent,
+            "night_reference_sunshine_hours": decision.night_reference_sunshine_hours,
+            "night_surplus_mode_active": decision.night_surplus_mode_active,
         }
 
     def _previous_intended_target_is_on(self, state: PumpPolicyState | None) -> bool | None:
@@ -626,14 +831,14 @@ class PumpControlSystem:
             return False
         return automatic_target_is_on
 
-    def _is_within_quiet_hours(self) -> bool:
-        local_now = self._local_now()
+    def _is_within_quiet_hours(self, *, local_now: datetime | None = None) -> bool:
+        candidate = local_now or self._local_now()
         off_start = self._auto_off_start_minutes
         resume_start = self._auto_resume_start_minutes
         if off_start == resume_start:
             return False
 
-        current_minutes = (local_now.hour * 60) + local_now.minute
+        current_minutes = (candidate.hour * 60) + candidate.minute
         if off_start < resume_start:
             return off_start <= current_minutes < resume_start
         return current_minutes >= off_start or current_minutes < resume_start
@@ -672,20 +877,11 @@ class PumpControlSystem:
             weather_cache_today_min_temperature_c=weather.today_min_temperature_c,
             weather_cache_today_max_temperature_c=weather.today_max_temperature_c,
             weather_cache_today_sunshine_hours=weather.today_sunshine_hours,
+            weather_cache_tomorrow_sunshine_hours=weather.tomorrow_sunshine_hours,
             weather_cache_weather_code=weather.weather_code,
             weather_cache_queried_timezone=weather.queried_timezone,
             weather_cache_cached_at_iso=datetime.now(UTC).isoformat(),
         )
-
-    @staticmethod
-    def _with_quiet_hours_state(
-        state: PumpPolicyState,
-        *,
-        quiet_hours_forced_off: bool,
-    ) -> PumpPolicyState:
-        if state.quiet_hours_forced_off == quiet_hours_forced_off:
-            return state
-        return replace(state, quiet_hours_forced_off=quiet_hours_forced_off)
 
 
 def _hhmm_to_minutes(value: str | None) -> int:

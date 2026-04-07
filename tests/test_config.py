@@ -64,6 +64,35 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.sunshine_hours_min, 4.5)
         self.assertEqual(settings.battery_min_soc_percent, 45.0)
 
+    def test_load_settings_parses_surplus_night_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "SURPLUS_NIGHT_ENABLED=false",
+                        "SURPLUS_NIGHT_BASE_LOAD_KW=1.7",
+                        "SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT=25",
+                        "SURPLUS_NIGHT_BUFFER_SOC_PERCENT=6",
+                        "SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=12",
+                        "SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT=7",
+                        "SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN=9.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            settings = load_settings(env_path)
+
+        self.assertFalse(settings.surplus_night_enabled)
+        self.assertEqual(settings.surplus_night_base_load_kw, 1.7)
+        self.assertEqual(settings.surplus_night_hard_min_soc_percent, 25.0)
+        self.assertEqual(settings.surplus_night_buffer_soc_percent, 6.0)
+        self.assertEqual(settings.surplus_night_turn_on_margin_soc_percent, 12.0)
+        self.assertEqual(settings.surplus_night_turn_off_margin_soc_percent, 7.0)
+        self.assertEqual(settings.surplus_night_next_day_sunshine_min, 9.5)
+
     def test_load_settings_rejects_invalid_sunshine_hours_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"

@@ -11,6 +11,7 @@ Python automation for a Cerbo GX and Shelly-controlled circulation pump. The pro
 - `plug-*`: inspect or manually control the Shelly plug directly
 - `scripts/pump_control_snapshot.py`: run one controller cycle from a plain Python script for Raspberry Pi scheduling
 - `scripts/pump_control_loop.py`: run controller cycles continuously in a fixed interval loop (default 15 seconds)
+- `scripts/augment_historicals_weather.py`: enrich exported historical CSV files with per-day Open-Meteo archive weather columns
 
 Email notifications are sent for:
 
@@ -53,11 +54,18 @@ CERBO_MOCK_ENABLED=false
 WEATHER_LATITUDE=39.707337
 WEATHER_LONGITUDE=2.791675
 WEATHER_TIMEZONE=Europe/Madrid
-SUNSHINE_HOURS_MIN=4.5
-BATTERY_MIN_SOC_PERCENT=45
+SUNSHINE_HOURS_MIN=6.5
+BATTERY_MIN_SOC_PERCENT=55
 AUTO_OFF_START_LOCAL=18:00
 AUTO_RESUME_START_LOCAL=08:00
 AUTO_CONTROL_TIMEZONE=Europe/Madrid
+SURPLUS_NIGHT_ENABLED=true
+SURPLUS_NIGHT_BASE_LOAD_KW=1.5
+SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT=25
+SURPLUS_NIGHT_BUFFER_SOC_PERCENT=5
+SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=10
+SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT=5
+SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN=9.0
 DATABASE_URL=sqlite:///.state/automation.db
 DATABASE_AUTO_MIGRATE=false
 SHELLY_HOST=192.168.68.90
@@ -72,11 +80,19 @@ SMTP_GMAIL_APP_PASSWORD=your-gmail-app-password
 SMTP_GMAIL_RECIPIENTS=f.kotschenreuther@yahoo.de,monika_kotschenreuther@yahoo.de,kkotsche1@gmail.com
 ```
 
-`SUNSHINE_HOURS_MIN` configures the minimum daily direct-sunshine forecast required for automatic daytime demand. The controller requests `sunshine_duration` from Open-Meteo, converts it to hours, and only allows automatic demand when the forecast meets or exceeds this threshold. The initial production default for this installation is `4.5`.
+`SUNSHINE_HOURS_MIN` configures the minimum daily direct-sunshine forecast required for automatic daytime demand. The controller requests `sunshine_duration` from Open-Meteo, converts it to hours, and only allows automatic demand when the forecast meets or exceeds this threshold. The initial production default for this installation is `6.5`.
 
-`BATTERY_MIN_SOC_PERCENT` configures the single battery cutoff. It must be a numeric percentage between `0` and `100`. Automatic demand may run only when battery SOC is strictly above this value; at or below it, the pump stays off. The recommended starting value for this installation is `45`.
+`BATTERY_MIN_SOC_PERCENT` configures the single battery cutoff. It must be a numeric percentage between `0` and `100`. Automatic demand may run only when battery SOC is strictly above this value; at or below it, the pump stays off. The recommended starting value for this installation is `55`.
 
-`AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` define one fixed year-round quiet-hours window in `AUTO_CONTROL_TIMEZONE`. While quiet hours are active, the pump target is forced `OFF` regardless of sunshine hours or battery SOC.
+`AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` define the overnight control window in `AUTO_CONTROL_TIMEZONE`. With `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware overnight automation instead of a hard forced-`OFF` quiet-hours block.
+
+The surplus-night settings keep the logic simple and deterministic:
+
+- `SURPLUS_NIGHT_BASE_LOAD_KW` is the fixed overnight house base load used to reserve battery energy.
+- `SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT` is the hard battery floor.
+- `SURPLUS_NIGHT_BUFFER_SOC_PERCENT` adds a small extra reserve above the hard floor.
+- `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT` and `SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT` provide the night hysteresis.
+- `SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN` is the required sunshine-hours forecast for the next daylight period before night runtime is allowed.
 
 `DATABASE_URL` points to the SQLAlchemy database connection used for runtime state and historical tracking. `DATABASE_AUTO_MIGRATE=true` can be enabled to run Alembic migrations automatically when the controller starts. For Raspberry Pi timer deployments, enable it or run `python -m vrm_solar_automation db-upgrade` before restarting the timer whenever the schema changes.
 
@@ -123,6 +139,14 @@ Run continuous control every 15 seconds in one long-lived process:
 ```bash
 python scripts/pump_control_loop.py --env-file .env --interval-seconds 15
 ```
+
+Augment all CSV files in `historicals/` with daily weather fields (three original header rows are preserved and weather columns are appended):
+
+```bash
+python scripts/augment_historicals_weather.py --env-file .env
+```
+
+By default this writes to `historicals/weather_augmented/`. Use `--in-place` to overwrite source files. The augmenter requests Open-Meteo archive data in day chunks (`--chunk-days`, default `31`) and applies exponential backoff plus `Retry-After` handling on `429`/transient server responses.
 
 In long-running mode, weather is cached in memory per local weather day (`WEATHER_TIMEZONE`), so repeated cycles do not call Open-Meteo every interval. The cache resets when the process restarts.
 
@@ -226,9 +250,11 @@ The controller follows a small deterministic flow:
 4. If demand exists, use the configured battery cutoff from `.env`:
    - turn `OFF` at or below `BATTERY_MIN_SOC_PERCENT`
    - allow `ON` only when SOC is strictly above `BATTERY_MIN_SOC_PERCENT`
-5. Apply quiet hours after the automatic target is calculated:
-   - use the fixed year-round `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` window in `AUTO_CONTROL_TIMEZONE`
-   - while quiet hours are active, the pump target is forced `OFF` regardless of SOC
+5. During the overnight window (`AUTO_OFF_START_LOCAL` to `AUTO_RESUME_START_LOCAL`):
+   - if `SURPLUS_NIGHT_ENABLED=false`, the pump target is forced `OFF`
+   - if `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware night mode
+   - after the nightly start time, the night rule uses tomorrow's sunshine forecast; after midnight it uses today's sunshine forecast
+   - the pump turns `ON` only when SOC stays above the hard floor plus safety buffer plus reserved overnight base-load energy, with separate turn-on and turn-off margins for hysteresis
 
 ## State handling
 
@@ -240,8 +266,9 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 `control_cycle` rows include:
 
 - Cerbo GX metrics (battery, solar, house, generator, active source, phase values)
-- weather snapshot used for policy evaluation, including `today_sunshine_hours`, plus `weather_source` (`live`, `same_day_cache`, or `unavailable`)
+- weather snapshot used for policy evaluation, including `today_sunshine_hours`, `tomorrow_sunshine_hours`, plus `weather_source` (`live`, `same_day_cache`, or `unavailable`)
 - policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`)
+- reserve-aware night diagnostics (`night_required_soc_percent`, `night_surplus_mode_active`) when the overnight rule is active
 - intended target and quiet-hours block metadata
 - Shelly actuation result (`status`, command, observed before/after, error)
 

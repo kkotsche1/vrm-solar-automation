@@ -51,6 +51,7 @@ class StateStore:
                 weather_cache_today_min_temperature_c=row.weather_cache_today_min_temperature_c,
                 weather_cache_today_max_temperature_c=row.weather_cache_today_max_temperature_c,
                 weather_cache_today_sunshine_hours=row.weather_cache_today_sunshine_hours,
+                weather_cache_tomorrow_sunshine_hours=row.weather_cache_tomorrow_sunshine_hours,
                 weather_cache_weather_code=row.weather_cache_weather_code,
                 weather_cache_queried_timezone=row.weather_cache_queried_timezone,
                 weather_cache_cached_at_iso=row.weather_cache_cached_at_iso,
@@ -79,6 +80,7 @@ class StateStore:
                     weather_cache_today_min_temperature_c=state.weather_cache_today_min_temperature_c,
                     weather_cache_today_max_temperature_c=state.weather_cache_today_max_temperature_c,
                     weather_cache_today_sunshine_hours=state.weather_cache_today_sunshine_hours,
+                    weather_cache_tomorrow_sunshine_hours=state.weather_cache_tomorrow_sunshine_hours,
                     weather_cache_weather_code=state.weather_cache_weather_code,
                     weather_cache_queried_timezone=state.weather_cache_queried_timezone,
                     weather_cache_cached_at_iso=state.weather_cache_cached_at_iso,
@@ -107,6 +109,9 @@ class StateStore:
                 )
                 row.weather_cache_today_sunshine_hours = (
                     state.weather_cache_today_sunshine_hours
+                )
+                row.weather_cache_tomorrow_sunshine_hours = (
+                    state.weather_cache_tomorrow_sunshine_hours
                 )
                 row.weather_cache_weather_code = state.weather_cache_weather_code
                 row.weather_cache_queried_timezone = state.weather_cache_queried_timezone
@@ -154,6 +159,9 @@ class StateStore:
                     today_min_temperature_c=_optional_float(weather.get("today_min_temperature_c")),
                     today_max_temperature_c=_optional_float(weather.get("today_max_temperature_c")),
                     today_sunshine_hours=_optional_float(weather.get("today_sunshine_hours")),
+                    tomorrow_sunshine_hours=_optional_float(
+                        weather.get("tomorrow_sunshine_hours")
+                    ),
                     weather_code=_optional_int(weather.get("weather_code")),
                     queried_timezone=_optional_str(weather.get("queried_timezone")),
                     weather_source=weather_source,
@@ -161,6 +169,8 @@ class StateStore:
                     decision_action=decision.action,
                     decision_reason=decision.reason,
                     decision_weather_mode=decision.weather_mode,
+                    night_required_soc_percent=decision.night_required_soc_percent,
+                    night_surplus_mode_active=decision.night_surplus_mode_active,
                     intended_target_is_on=intended_target_is_on,
                     quiet_hours_blocked=quiet_hours_blocked,
                     blocked_reason=blocked_reason,

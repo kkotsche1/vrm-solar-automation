@@ -9,8 +9,8 @@ from .weather import WeatherSnapshot
 
 @dataclass(frozen=True)
 class PumpPolicyConfig:
-    battery_min_soc: float = 45.0
-    sunshine_hours_min: float = 4.5
+    battery_min_soc: float = 55.0
+    sunshine_hours_min: float = 6.5
     generator_on_block_watts: float = 100.0
 
 
@@ -28,6 +28,7 @@ class PumpPolicyState:
     weather_cache_today_min_temperature_c: float | None = None
     weather_cache_today_max_temperature_c: float | None = None
     weather_cache_today_sunshine_hours: float | None = None
+    weather_cache_tomorrow_sunshine_hours: float | None = None
     weather_cache_weather_code: int | None = None
     weather_cache_queried_timezone: str | None = None
     weather_cache_cached_at_iso: str | None = None
@@ -52,6 +53,7 @@ class PumpPolicyState:
             today_sunshine_hours=self.weather_cache_today_sunshine_hours,
             weather_code=self.weather_cache_weather_code,
             queried_timezone=self.weather_cache_queried_timezone,
+            tomorrow_sunshine_hours=self.weather_cache_tomorrow_sunshine_hours,
         )
 
     def to_dict(self) -> dict[str, str | bool | float | int | None]:
@@ -68,6 +70,7 @@ class PumpPolicyState:
             "weather_cache_today_min_temperature_c": self.weather_cache_today_min_temperature_c,
             "weather_cache_today_max_temperature_c": self.weather_cache_today_max_temperature_c,
             "weather_cache_today_sunshine_hours": self.weather_cache_today_sunshine_hours,
+            "weather_cache_tomorrow_sunshine_hours": self.weather_cache_tomorrow_sunshine_hours,
             "weather_cache_weather_code": self.weather_cache_weather_code,
             "weather_cache_queried_timezone": self.weather_cache_queried_timezone,
             "weather_cache_cached_at_iso": self.weather_cache_cached_at_iso,
@@ -85,6 +88,9 @@ class PumpDecision:
     reason: str
     reasons: list[str] = field(default_factory=list)
     weather_mode: str = "unknown"
+    night_required_soc_percent: float | None = None
+    night_reference_sunshine_hours: float | None = None
+    night_surplus_mode_active: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -93,6 +99,9 @@ class PumpDecision:
             "reason": self.reason,
             "reasons": self.reasons,
             "weather_mode": self.weather_mode,
+            "night_required_soc_percent": self.night_required_soc_percent,
+            "night_reference_sunshine_hours": self.night_reference_sunshine_hours,
+            "night_surplus_mode_active": self.night_surplus_mode_active,
         }
 
 
