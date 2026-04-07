@@ -15,3 +15,5 @@ frontend/.npm-cache/
 .venv-wsl
 
 *.db
+*.xlsx
+*.csx
