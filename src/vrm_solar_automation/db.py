@@ -32,6 +32,7 @@ class ControllerStateRecord(Base):
     generator_running_alert_sent: Mapped[bool] = mapped_column(
         BOOLEAN, nullable=False, default=False
     )
+    weather_block_alert_sent_local_date: Mapped[str | None] = mapped_column(String(10))
     weather_cache_local_date: Mapped[str | None] = mapped_column(String(10))
     weather_cache_current_temperature_c: Mapped[float | None] = mapped_column(FLOAT)
     weather_cache_today_min_temperature_c: Mapped[float | None] = mapped_column(FLOAT)

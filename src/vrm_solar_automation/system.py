@@ -221,6 +221,8 @@ class PumpControlSystem:
         final_state = self._apply_alert_state(
             final_state,
             power=power,
+            decision=decision,
+            weather=weather,
         )
         final_state = self._with_weather_cache(
             final_state,
@@ -527,6 +529,8 @@ class PumpControlSystem:
         state: PumpPolicyState,
         *,
         power: PowerSnapshot,
+        decision: PumpDecision,
+        weather: WeatherSnapshot,
     ) -> PumpPolicyState:
         battery_soc = power.battery_soc_percent
         generator_watts = abs(power.generator_watts or 0.0)
@@ -566,12 +570,27 @@ class PumpControlSystem:
                 crossed_thresholds=tuple(crossed_thresholds),
             )
 
+        weather_block_alert_sent_local_date = state.weather_block_alert_sent_local_date
+        weather_local_date = self._weather_local_date().isoformat()
+        if (
+            self._notifier is not None
+            and self._decision_is_weather_blocked(decision=decision)
+            and weather_block_alert_sent_local_date != weather_local_date
+        ):
+            self._send_weather_blocked_alert(
+                decision=decision,
+                weather=weather,
+                local_date=weather_local_date,
+            )
+            weather_block_alert_sent_local_date = weather_local_date
+
         return replace(
             state,
             battery_alert_below_40_sent=battery_alert_below_40_sent,
             battery_alert_below_35_sent=battery_alert_below_35_sent,
             battery_alert_below_30_sent=battery_alert_below_30_sent,
             generator_running_alert_sent=generator_running_alert_sent,
+            weather_block_alert_sent_local_date=weather_block_alert_sent_local_date,
         )
 
     def _send_battery_alert(
@@ -601,6 +620,47 @@ class PumpControlSystem:
             )
         except Exception as exc:  # pragma: no cover - defensive logging path
             LOGGER.warning("Failed to send generator alert email: %s", exc)
+
+    def _send_weather_blocked_alert(
+        self,
+        *,
+        decision: PumpDecision,
+        weather: WeatherSnapshot,
+        local_date: str,
+    ) -> None:
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.send_weather_blocked_alert_email(
+                at_iso=datetime.now(UTC).isoformat(),
+                local_date=local_date,
+                weather_mode=decision.weather_mode,
+                decision_reason=decision.reason,
+                today_sunshine_hours=weather.today_sunshine_hours,
+                tomorrow_sunshine_hours=weather.tomorrow_sunshine_hours,
+                night_reference_sunshine_hours=decision.night_reference_sunshine_hours,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            LOGGER.warning("Failed to send weather-block alert email: %s", exc)
+
+    def _decision_is_weather_blocked(self, *, decision: PumpDecision) -> bool:
+        if decision.should_turn_on:
+            return False
+
+        reason = decision.reason.lower()
+        if decision.weather_mode in {"insufficient_sun", "unknown"}:
+            return (
+                "automatic demand is off" in reason
+                or "automatic control stays off" in reason
+            )
+
+        if decision.weather_mode == "surplus_night":
+            return (
+                "sunshine-hours forecast is unavailable" in reason
+                or "surplus-night minimum" in reason
+            )
+
+        return False
 
     @staticmethod
     def _should_keep_battery_alert(

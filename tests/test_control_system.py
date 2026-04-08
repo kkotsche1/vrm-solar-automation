@@ -121,6 +121,7 @@ class FakeNotifier:
         self.calls: list[dict[str, object]] = []
         self.battery_alert_calls: list[dict[str, object]] = []
         self.generator_alert_calls: list[dict[str, object]] = []
+        self.weather_block_alert_calls: list[dict[str, object]] = []
 
     def send_plug_state_change_email(
         self,
@@ -176,6 +177,31 @@ class FakeNotifier:
             {
                 "generator_watts": generator_watts,
                 "at_iso": at_iso,
+            }
+        )
+        if self.should_raise:
+            raise RuntimeError("smtp failed")
+
+    def send_weather_blocked_alert_email(
+        self,
+        *,
+        at_iso: str,
+        local_date: str,
+        weather_mode: str,
+        decision_reason: str,
+        today_sunshine_hours: float | None,
+        tomorrow_sunshine_hours: float | None,
+        night_reference_sunshine_hours: float | None,
+    ) -> None:
+        self.weather_block_alert_calls.append(
+            {
+                "at_iso": at_iso,
+                "local_date": local_date,
+                "weather_mode": weather_mode,
+                "decision_reason": decision_reason,
+                "today_sunshine_hours": today_sunshine_hours,
+                "tomorrow_sunshine_hours": tomorrow_sunshine_hours,
+                "night_reference_sunshine_hours": night_reference_sunshine_hours,
             }
         )
         if self.should_raise:
@@ -770,6 +796,107 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(final_payload["next_state"]["battery_alert_below_40_sent"])
         self.assertFalse(final_payload["next_state"]["battery_alert_below_35_sent"])
         self.assertFalse(final_payload["next_state"]["battery_alert_below_30_sent"])
+
+    async def test_weather_block_alert_is_sent_once_per_weather_day(self) -> None:
+        notifier = FakeNotifier()
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                [
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
+                ]
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=3.0)),
+            state_store=FakeStateStore(),
+            notifier=notifier,
+            now_provider=_fixed_now(2026, 1, 10, 10, 0),
+        )
+
+        await system.control()
+        _, payload = await system.control()
+
+        self.assertEqual(len(notifier.weather_block_alert_calls), 1)
+        self.assertEqual(notifier.weather_block_alert_calls[0]["local_date"], "2026-01-10")
+        self.assertEqual(payload["next_state"]["weather_block_alert_sent_local_date"], "2026-01-10")
+
+    async def test_weather_block_alert_can_send_again_next_weather_day(self) -> None:
+        notifier = FakeNotifier()
+        state_store = FakeStateStore()
+        first_system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=3.0)),
+            state_store=state_store,
+            notifier=notifier,
+            now_provider=_fixed_now(2026, 1, 10, 10, 0),
+        )
+        second_system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=3.0)),
+            state_store=state_store,
+            notifier=notifier,
+            now_provider=_fixed_now(2026, 1, 11, 10, 0),
+        )
+
+        await first_system.control()
+        _, payload = await second_system.control()
+
+        self.assertEqual(len(notifier.weather_block_alert_calls), 2)
+        self.assertEqual(
+            [call["local_date"] for call in notifier.weather_block_alert_calls],
+            ["2026-01-10", "2026-01-11"],
+        )
+        self.assertEqual(payload["next_state"]["weather_block_alert_sent_local_date"], "2026-01-11")
+
+    async def test_weather_block_alert_triggers_for_unknown_forecast(self) -> None:
+        notifier = FakeNotifier()
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+            weather_client=FakeAlwaysFailWeatherClient(),
+            state_store=FakeStateStore(),
+            notifier=notifier,
+            now_provider=_fixed_now(2026, 1, 10, 10, 0),
+        )
+
+        decision, _ = await system.control()
+
+        self.assertEqual(decision.weather_mode, "unknown")
+        self.assertEqual(len(notifier.weather_block_alert_calls), 1)
+        self.assertEqual(notifier.weather_block_alert_calls[0]["weather_mode"], "unknown")
+
+    async def test_weather_block_alert_does_not_trigger_for_non_weather_off(self) -> None:
+        notifier = FakeNotifier()
+        state_store = FakeStateStore()
+        low_soc_system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=45.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.0)),
+            state_store=state_store,
+            notifier=notifier,
+            now_provider=_fixed_now(2026, 1, 10, 10, 0),
+        )
+        generator_system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=1200.0, battery_soc_percent=90.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=3.0)),
+            state_store=state_store,
+            notifier=notifier,
+            now_provider=_fixed_now(2026, 1, 10, 10, 30),
+        )
+
+        low_soc_decision, _ = await low_soc_system.control()
+        generator_decision, _ = await generator_system.control()
+
+        self.assertFalse(low_soc_decision.should_turn_on)
+        self.assertFalse(generator_decision.should_turn_on)
+        self.assertEqual(len(notifier.weather_block_alert_calls), 0)
 
     async def test_manual_shelly_off_during_automatic_on_waits_for_next_off_then_on(self) -> None:
         state_store = FakeStateStore()

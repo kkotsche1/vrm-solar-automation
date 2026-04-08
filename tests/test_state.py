@@ -26,6 +26,7 @@ class StateStoreTests(unittest.TestCase):
                     battery_alert_below_35_sent=True,
                     battery_alert_below_30_sent=False,
                     generator_running_alert_sent=True,
+                    weather_block_alert_sent_local_date="2026-01-01",
                     weather_cache_local_date="2026-01-01",
                     weather_cache_current_temperature_c=10.0,
                     weather_cache_today_min_temperature_c=8.0,
@@ -143,6 +144,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertIn("battery_alert_below_35_sent", columns)
         self.assertIn("battery_alert_below_30_sent", columns)
         self.assertIn("generator_running_alert_sent", columns)
+        self.assertIn("weather_block_alert_sent_local_date", columns)
         self.assertIn("weather_cache_local_date", columns)
         self.assertIn("weather_cache_current_temperature_c", columns)
         self.assertIn("weather_cache_today_min_temperature_c", columns)

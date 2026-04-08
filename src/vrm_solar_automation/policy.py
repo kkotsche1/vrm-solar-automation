@@ -23,6 +23,7 @@ class PumpPolicyState:
     battery_alert_below_35_sent: bool = False
     battery_alert_below_30_sent: bool = False
     generator_running_alert_sent: bool = False
+    weather_block_alert_sent_local_date: str | None = None
     weather_cache_local_date: str | None = None
     weather_cache_current_temperature_c: float | None = None
     weather_cache_today_min_temperature_c: float | None = None
@@ -65,6 +66,7 @@ class PumpPolicyState:
             "battery_alert_below_35_sent": self.battery_alert_below_35_sent,
             "battery_alert_below_30_sent": self.battery_alert_below_30_sent,
             "generator_running_alert_sent": self.generator_running_alert_sent,
+            "weather_block_alert_sent_local_date": self.weather_block_alert_sent_local_date,
             "weather_cache_local_date": self.weather_cache_local_date,
             "weather_cache_current_temperature_c": self.weather_cache_current_temperature_c,
             "weather_cache_today_min_temperature_c": self.weather_cache_today_min_temperature_c,

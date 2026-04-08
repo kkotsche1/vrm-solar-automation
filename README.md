@@ -18,8 +18,9 @@ Email notifications are sent for:
 - Shelly plug state changes initiated by the controller
 - battery SOC dropping below `40%`, `35%`, and `30%`
 - generator power being detected at `100 W` or higher
+- weather-based forecast blocks that keep automation `OFF` (sent at most once per weather-local day)
 
-Battery and generator alerts are latched in the database, so a one-shot scheduler only sends one alert per active condition. The latch resets automatically after battery SOC recovers above the threshold or generator power disappears.
+Battery and generator alerts are latched in the database, so a one-shot scheduler only sends one alert per active condition. The latch resets automatically after battery SOC recovers above the threshold or generator power disappears. Weather-block alerts are date-latched and send once per `WEATHER_TIMEZONE` day.
 
 Manual override is no longer stored in the backend. If the plug is changed in the Shelly app, the automation waits for a fresh automatic transition before reasserting the plug state:
 
@@ -85,6 +86,7 @@ SMTP_GMAIL_RECIPIENTS=f.kotschenreuther@yahoo.de,monika_kotschenreuther@yahoo.de
 `BATTERY_MIN_SOC_PERCENT` configures the single battery cutoff. It must be a numeric percentage between `0` and `100`. Automatic demand may run only when battery SOC is strictly above this value; at or below it, the pump stays off. The recommended starting value for this installation is `55`.
 
 `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` define the overnight control window in `AUTO_CONTROL_TIMEZONE`. With `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware overnight automation instead of a hard forced-`OFF` quiet-hours block.
+Seasonal `SUMMER_*` / `WINTER_*` quiet-hours keys are not supported.
 
 The surplus-night settings keep the logic simple and deterministic:
 
@@ -274,7 +276,7 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 
 The runtime state still lets one-shot scheduling tolerate manual Shelly changes without introducing a separate override system. It also persists whether the previous cycle was quiet-hours-forced so a one-shot scheduler can turn the plug back on correctly when the quiet-hours window ends.
 
-The same singleton runtime row also stores the alert latches for the `40%`, `35%`, and `30%` battery warnings plus the generator-running warning.
+The same singleton runtime row also stores the alert latches for the `40%`, `35%`, and `30%` battery warnings plus the generator-running warning and the weather-block daily notification date.
 
 The same singleton runtime row also caches the last successful weather snapshot for the local weather day. That cache is what prevents transient Open-Meteo failures from causing a same-minute `OFF` followed by `ON` when the next scheduled run succeeds again.
 
@@ -287,6 +289,8 @@ Initial setup:
 ```bash
 python -m vrm_solar_automation db-upgrade
 ```
+
+After upgrading to versions that add alert/runtime fields (including the weather-block daily latch), run `db-upgrade` before restarting scheduled control cycles.
 
 Backup:
 

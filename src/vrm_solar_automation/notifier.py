@@ -73,6 +73,32 @@ class GmailSmtpNotifier:
             ),
         )
 
+    def send_weather_blocked_alert_email(
+        self,
+        *,
+        at_iso: str,
+        local_date: str,
+        weather_mode: str,
+        decision_reason: str,
+        today_sunshine_hours: float | None,
+        tomorrow_sunshine_hours: float | None,
+        night_reference_sunshine_hours: float | None,
+    ) -> None:
+        self._send_email(
+            subject=f"VRM weather block alert: automation OFF on {local_date}",
+            body_lines=(
+                "The VRM controller kept the pump OFF due to weather forecast conditions.",
+                f"Timestamp: {at_iso}",
+                f"Local weather date: {local_date}",
+                f"Weather mode: {weather_mode}",
+                f"Decision reason: {decision_reason}",
+                f"Today's sunshine hours: {self._format_hours(today_sunshine_hours)}",
+                f"Tomorrow's sunshine hours: {self._format_hours(tomorrow_sunshine_hours)}",
+                "Night reference sunshine hours: "
+                f"{self._format_hours(night_reference_sunshine_hours)}",
+            ),
+        )
+
     def _send_email(
         self,
         *,
@@ -95,3 +121,9 @@ class GmailSmtpNotifier:
         if value is None:
             return "unknown"
         return "ON" if value else "OFF"
+
+    @staticmethod
+    def _format_hours(value: float | None) -> str:
+        if value is None:
+            return "unknown"
+        return f"{value:.1f} h"

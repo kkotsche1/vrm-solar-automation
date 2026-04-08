@@ -46,6 +46,7 @@ class StateStore:
                 battery_alert_below_35_sent=bool(row.battery_alert_below_35_sent),
                 battery_alert_below_30_sent=bool(row.battery_alert_below_30_sent),
                 generator_running_alert_sent=bool(row.generator_running_alert_sent),
+                weather_block_alert_sent_local_date=row.weather_block_alert_sent_local_date,
                 weather_cache_local_date=row.weather_cache_local_date,
                 weather_cache_current_temperature_c=row.weather_cache_current_temperature_c,
                 weather_cache_today_min_temperature_c=row.weather_cache_today_min_temperature_c,
@@ -75,6 +76,7 @@ class StateStore:
                     battery_alert_below_35_sent=state.battery_alert_below_35_sent,
                     battery_alert_below_30_sent=state.battery_alert_below_30_sent,
                     generator_running_alert_sent=state.generator_running_alert_sent,
+                    weather_block_alert_sent_local_date=state.weather_block_alert_sent_local_date,
                     weather_cache_local_date=state.weather_cache_local_date,
                     weather_cache_current_temperature_c=state.weather_cache_current_temperature_c,
                     weather_cache_today_min_temperature_c=state.weather_cache_today_min_temperature_c,
@@ -99,6 +101,7 @@ class StateStore:
                 row.battery_alert_below_35_sent = state.battery_alert_below_35_sent
                 row.battery_alert_below_30_sent = state.battery_alert_below_30_sent
                 row.generator_running_alert_sent = state.generator_running_alert_sent
+                row.weather_block_alert_sent_local_date = state.weather_block_alert_sent_local_date
                 row.weather_cache_local_date = state.weather_cache_local_date
                 row.weather_cache_current_temperature_c = state.weather_cache_current_temperature_c
                 row.weather_cache_today_min_temperature_c = (
