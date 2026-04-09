@@ -10,7 +10,13 @@ from .weather import WeatherSnapshot
 @dataclass(frozen=True)
 class PumpPolicyConfig:
     battery_min_soc: float = 55.0
+    battery_soft_min_soc: float = 35.0
+    battery_hard_min_soc: float = 30.0
     sunshine_hours_min: float = 6.5
+    forecast_liberal_sunshine_hours_min: float = 9.0
+    forecast_liberal_sunshine_hours_max: float = 12.0
+    auto_resume_start_local: str = "08:00"
+    day_morning_bias_end_local: str = "11:00"
     generator_on_block_watts: float = 100.0
 
 
@@ -19,6 +25,9 @@ class PumpPolicyState:
     is_on: bool
     changed_at_iso: str
     quiet_hours_forced_off: bool = False
+    consecutive_power_failures: int = 0
+    last_power_failure_at_iso: str | None = None
+    last_power_failure_error: str | None = None
     battery_alert_below_40_sent: bool = False
     battery_alert_below_35_sent: bool = False
     battery_alert_below_30_sent: bool = False
@@ -62,6 +71,9 @@ class PumpPolicyState:
             "is_on": self.is_on,
             "changed_at_iso": self.changed_at_iso,
             "quiet_hours_forced_off": self.quiet_hours_forced_off,
+            "consecutive_power_failures": self.consecutive_power_failures,
+            "last_power_failure_at_iso": self.last_power_failure_at_iso,
+            "last_power_failure_error": self.last_power_failure_error,
             "battery_alert_below_40_sent": self.battery_alert_below_40_sent,
             "battery_alert_below_35_sent": self.battery_alert_below_35_sent,
             "battery_alert_below_30_sent": self.battery_alert_below_30_sent,
@@ -90,9 +102,13 @@ class PumpDecision:
     reason: str
     reasons: list[str] = field(default_factory=list)
     weather_mode: str = "unknown"
+    soc_control_mode: str = "daytime_adaptive"
     night_required_soc_percent: float | None = None
     night_reference_sunshine_hours: float | None = None
     night_surplus_mode_active: bool = False
+    effective_turn_on_soc_percent: float | None = None
+    effective_turn_off_soc_percent: float | None = None
+    forecast_liberal_factor: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -101,15 +117,23 @@ class PumpDecision:
             "reason": self.reason,
             "reasons": self.reasons,
             "weather_mode": self.weather_mode,
+            "soc_control_mode": self.soc_control_mode,
             "night_required_soc_percent": self.night_required_soc_percent,
             "night_reference_sunshine_hours": self.night_reference_sunshine_hours,
             "night_surplus_mode_active": self.night_surplus_mode_active,
+            "effective_turn_on_soc_percent": self.effective_turn_on_soc_percent,
+            "effective_turn_off_soc_percent": self.effective_turn_off_soc_percent,
+            "forecast_liberal_factor": self.forecast_liberal_factor,
         }
 
 
 class PumpPolicy:
     def __init__(self, config: PumpPolicyConfig | None = None) -> None:
         self._config = config or PumpPolicyConfig()
+        self._auto_resume_start_minutes = _hhmm_to_minutes(self._config.auto_resume_start_local)
+        self._day_morning_bias_end_minutes = _hhmm_to_minutes(
+            self._config.day_morning_bias_end_local
+        )
 
     def decide(
         self,
@@ -119,10 +143,28 @@ class PumpPolicy:
         previous_state: PumpPolicyState | None,
         now: datetime | None = None,
     ) -> PumpDecision:
-        del now
         weather_mode = self._classify_weather(weather)
         battery_soc = power.battery_soc_percent
         generator_watts = abs(power.generator_watts or 0.0)
+        sunshine_hours = weather.today_sunshine_hours
+        previous_target_is_on = previous_state.is_on if previous_state is not None else False
+        liberal_factor = forecast_liberal_factor(
+            sunshine_hours,
+            liberal_sunshine_hours_min=self._config.forecast_liberal_sunshine_hours_min,
+            liberal_sunshine_hours_max=self._config.forecast_liberal_sunshine_hours_max,
+        )
+        thresholds = self._daytime_thresholds(
+            liberal_factor=liberal_factor,
+            keep_running_bias_active=(
+                previous_target_is_on and self._is_morning_bias_active(local_now=now)
+            ),
+        )
+        effective_turn_on_soc_percent = (
+            thresholds.turn_on_soc if sunshine_hours is not None else None
+        )
+        effective_turn_off_soc_percent = (
+            thresholds.turn_off_soc if sunshine_hours is not None else None
+        )
 
         if battery_soc is None:
             return PumpDecision(
@@ -131,6 +173,9 @@ class PumpPolicy:
                 reason="Battery SOC is unavailable, so the policy fails safe to off.",
                 reasons=["Battery SOC is unavailable."],
                 weather_mode=weather_mode,
+                effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+                effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+                forecast_liberal_factor=liberal_factor,
             )
 
         if generator_watts >= self._config.generator_on_block_watts:
@@ -138,6 +183,9 @@ class PumpPolicy:
                 target_on=False,
                 previous_state=previous_state,
                 weather_mode=weather_mode,
+                effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+                effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+                forecast_liberal_factor=liberal_factor,
                 reason=(
                     f"Generator power is present at {generator_watts:.0f} W, so the pump should stay off."
                 ),
@@ -148,6 +196,9 @@ class PumpPolicy:
                 target_on=False,
                 previous_state=previous_state,
                 weather_mode=weather_mode,
+                effective_turn_on_soc_percent=None,
+                effective_turn_off_soc_percent=None,
+                forecast_liberal_factor=None,
                 reason="Today's sunshine-hours forecast is unavailable, so automatic control stays off.",
             )
 
@@ -156,21 +207,71 @@ class PumpPolicy:
                 target_on=False,
                 previous_state=previous_state,
                 weather_mode=weather_mode,
+                effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+                effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+                forecast_liberal_factor=liberal_factor,
                 reason=(
-                    f"Today's sunshine forecast is {weather.today_sunshine_hours:.1f} hours, below the "
+                    f"Today's sunshine forecast is {sunshine_hours:.1f} hours, below the "
                     f"{self._config.sunshine_hours_min:.1f}-hour minimum, so automatic demand is off."
                 ),
             )
 
-        if battery_soc <= self._config.battery_min_soc:
+        if battery_soc <= self._config.battery_hard_min_soc:
             return self._decision(
                 target_on=False,
                 previous_state=previous_state,
                 weather_mode=weather_mode,
+                effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+                effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+                forecast_liberal_factor=liberal_factor,
                 reason=(
-                    f"Today's sunshine forecast is {weather.today_sunshine_hours:.1f} hours, but battery SOC is "
-                    f"{battery_soc:.1f}%, at or below the {self._config.battery_min_soc:.1f}% minimum, so the pump "
-                    "should stay off."
+                    f"Today's sunshine forecast is {sunshine_hours:.1f} hours, but battery SOC is "
+                    f"{battery_soc:.1f}%, at or below the {self._config.battery_hard_min_soc:.1f}% hard automatic "
+                    "cutoff, so the pump should stay off."
+                ),
+            )
+
+        if previous_target_is_on:
+            if battery_soc <= thresholds.turn_off_soc:
+                return self._decision(
+                    target_on=False,
+                    previous_state=previous_state,
+                    weather_mode=weather_mode,
+                    effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+                    effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+                    forecast_liberal_factor=liberal_factor,
+                    reason=(
+                        f"Today's sunshine forecast is {sunshine_hours:.1f} hours, but adaptive daytime control "
+                        f"needs at least {thresholds.turn_off_soc:.1f}% SOC to keep running and battery SOC is "
+                        f"{battery_soc:.1f}%, so the pump turns off."
+                    ),
+                )
+            return self._decision(
+                target_on=True,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+                effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+                forecast_liberal_factor=liberal_factor,
+                reason=(
+                    f"Today's sunshine forecast is {sunshine_hours:.1f} hours, meeting the "
+                    f"{self._config.sunshine_hours_min:.1f}-hour minimum, and battery SOC is {battery_soc:.1f}%, "
+                    f"above the adaptive {thresholds.turn_off_soc:.1f}% keep-running threshold."
+                ),
+            )
+
+        if battery_soc < thresholds.turn_on_soc:
+            return self._decision(
+                target_on=False,
+                previous_state=previous_state,
+                weather_mode=weather_mode,
+                effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+                effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+                forecast_liberal_factor=liberal_factor,
+                reason=(
+                    f"Today's sunshine forecast is {sunshine_hours:.1f} hours, but adaptive daytime control "
+                    f"needs at least {thresholds.turn_on_soc:.1f}% SOC to turn on and battery SOC is "
+                    f"{battery_soc:.1f}%, so the pump stays off."
                 ),
             )
 
@@ -178,10 +279,13 @@ class PumpPolicy:
             target_on=True,
             previous_state=previous_state,
             weather_mode=weather_mode,
+            effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+            effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+            forecast_liberal_factor=liberal_factor,
             reason=(
-                f"Today's sunshine forecast is {weather.today_sunshine_hours:.1f} hours, meeting the "
-                f"{self._config.sunshine_hours_min:.1f}-hour minimum, and battery SOC is {battery_soc:.1f}%, above "
-                f"the {self._config.battery_min_soc:.1f}% minimum run threshold."
+                f"Today's sunshine forecast is {sunshine_hours:.1f} hours, meeting the "
+                f"{self._config.sunshine_hours_min:.1f}-hour minimum, and battery SOC is {battery_soc:.1f}%, "
+                f"meeting the adaptive {thresholds.turn_on_soc:.1f}% turn-on threshold."
             ),
         )
 
@@ -200,6 +304,9 @@ class PumpPolicy:
         previous_state: PumpPolicyState | None,
         weather_mode: str,
         reason: str,
+        effective_turn_on_soc_percent: float | None = None,
+        effective_turn_off_soc_percent: float | None = None,
+        forecast_liberal_factor: float | None = None,
     ) -> PumpDecision:
         return PumpDecision(
             should_turn_on=target_on,
@@ -207,7 +314,43 @@ class PumpPolicy:
             reason=reason,
             reasons=[reason],
             weather_mode=weather_mode,
+            effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+            effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+            forecast_liberal_factor=forecast_liberal_factor,
         )
+
+    def _daytime_thresholds(
+        self,
+        *,
+        liberal_factor: float | None,
+        keep_running_bias_active: bool,
+    ) -> "_DaytimeThresholds":
+        factor = liberal_factor or 0.0
+        turn_on_soc = linear_interpolate(
+            self._config.battery_min_soc,
+            self._config.battery_soft_min_soc + 5.0,
+            factor,
+        )
+        turn_off_soc = linear_interpolate(
+            self._config.battery_min_soc,
+            self._config.battery_soft_min_soc,
+            factor,
+        )
+        if keep_running_bias_active:
+            turn_off_soc = max(
+                self._config.battery_hard_min_soc,
+                turn_off_soc - (5.0 * factor),
+            )
+        return _DaytimeThresholds(
+            turn_on_soc=turn_on_soc,
+            turn_off_soc=turn_off_soc,
+        )
+
+    def _is_morning_bias_active(self, *, local_now: datetime | None) -> bool:
+        if local_now is None:
+            return False
+        current_minutes = (local_now.hour * 60) + local_now.minute
+        return self._auto_resume_start_minutes <= current_minutes <= self._day_morning_bias_end_minutes
 
     @staticmethod
     def _action(target_on: bool, previous_state: PumpPolicyState | None) -> str:
@@ -216,3 +359,38 @@ class PumpPolicy:
         if previous_state.is_on == target_on:
             return "keep_on" if target_on else "keep_off"
         return "turn_on" if target_on else "turn_off"
+
+
+@dataclass(frozen=True)
+class _DaytimeThresholds:
+    turn_on_soc: float
+    turn_off_soc: float
+
+
+def forecast_liberal_factor(
+    sunshine_hours: float | None,
+    *,
+    liberal_sunshine_hours_min: float,
+    liberal_sunshine_hours_max: float,
+) -> float | None:
+    if sunshine_hours is None:
+        return None
+    if liberal_sunshine_hours_max <= liberal_sunshine_hours_min:
+        return 1.0 if sunshine_hours >= liberal_sunshine_hours_max else 0.0
+    if sunshine_hours <= liberal_sunshine_hours_min:
+        return 0.0
+    if sunshine_hours >= liberal_sunshine_hours_max:
+        return 1.0
+    return (sunshine_hours - liberal_sunshine_hours_min) / (
+        liberal_sunshine_hours_max - liberal_sunshine_hours_min
+    )
+
+
+def linear_interpolate(start: float, end: float, factor: float) -> float:
+    clamped_factor = min(1.0, max(0.0, factor))
+    return start + ((end - start) * clamped_factor)
+
+
+def _hhmm_to_minutes(value: str) -> int:
+    hour_raw, minute_raw = value.split(":", 1)
+    return (int(hour_raw) * 60) + int(minute_raw)

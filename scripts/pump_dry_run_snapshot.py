@@ -86,6 +86,13 @@ async def main() -> None:
     if payload["blocked_reason"]:
         print(f"  Block reason: {payload['blocked_reason']}")
     print(f"  Weather tomorrow sunshine: {_format_optional_hours(payload['weather']['tomorrow_sunshine_hours'])}")
+    print(
+        "  SOC mode: "
+        f"{payload['soc_control_mode']} | "
+        f"turn-on {_format_optional_percent(payload['effective_turn_on_soc_percent'])} | "
+        f"turn-off {_format_optional_percent(payload['effective_turn_off_soc_percent'])} | "
+        f"forecast factor {_format_optional_float(payload['forecast_liberal_factor'])}"
+    )
     if payload["night_surplus_mode_active"]:
         print(
             f"  Night reserve: {_format_optional_percent(payload['night_required_soc_percent'])}"
@@ -129,6 +136,12 @@ def _format_optional_percent(value: object) -> str:
     if value is None:
         return "unavailable"
     return f"{float(value):.1f}%"
+
+
+def _format_optional_float(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.1f}"
 
 
 def _format_optional_hours(value: object) -> str:

@@ -20,6 +20,9 @@ class ControllerStateRecord(Base):
     is_on: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
     changed_at_iso: Mapped[str] = mapped_column(String(40), nullable=False)
     quiet_hours_forced_off: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
+    consecutive_power_failures: Mapped[int] = mapped_column(INTEGER, nullable=False, default=0)
+    last_power_failure_at_iso: Mapped[str | None] = mapped_column(String(40))
+    last_power_failure_error: Mapped[str | None] = mapped_column(TEXT)
     battery_alert_below_40_sent: Mapped[bool] = mapped_column(
         BOOLEAN, nullable=False, default=False
     )
@@ -79,13 +82,20 @@ class ControlCycleRecord(Base):
     weather_code: Mapped[int | None] = mapped_column(INTEGER)
     queried_timezone: Mapped[str | None] = mapped_column(String(128))
     weather_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    power_status_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    power_status_available: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
+    power_status_error: Mapped[str | None] = mapped_column(TEXT)
 
     should_turn_on: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
     decision_action: Mapped[str] = mapped_column(String(32), nullable=False)
     decision_reason: Mapped[str] = mapped_column(TEXT, nullable=False)
     decision_weather_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    soc_control_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="daytime_adaptive")
     night_required_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
     night_surplus_mode_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
+    effective_turn_on_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
+    effective_turn_off_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
+    forecast_liberal_factor: Mapped[float | None] = mapped_column(FLOAT)
 
     intended_target_is_on: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
     quiet_hours_blocked: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)

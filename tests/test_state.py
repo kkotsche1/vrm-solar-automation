@@ -22,6 +22,9 @@ class StateStoreTests(unittest.TestCase):
                     is_on=True,
                     changed_at_iso=datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
                     quiet_hours_forced_off=True,
+                    consecutive_power_failures=2,
+                    last_power_failure_at_iso=datetime(2026, 1, 1, 4, tzinfo=UTC).isoformat(),
+                    last_power_failure_error="timed out",
                     battery_alert_below_40_sent=True,
                     battery_alert_below_35_sent=True,
                     battery_alert_below_30_sent=False,
@@ -80,14 +83,23 @@ class StateStoreTests(unittest.TestCase):
                         "queried_timezone": "Europe/Madrid",
                     },
                     weather_source="live",
+                    power_status={
+                        "source": "cerbo_modbus",
+                        "available": False,
+                        "error": "timed out",
+                    },
                     decision=PumpDecision(
                         should_turn_on=True,
                         action="turn_on",
                         reason="test",
                         reasons=["test"],
                         weather_mode="sufficient_sun",
+                        soc_control_mode="daytime_adaptive",
                         night_required_soc_percent=72.0,
                         night_surplus_mode_active=True,
+                        effective_turn_on_soc_percent=42.5,
+                        effective_turn_off_soc_percent=37.5,
+                        forecast_liberal_factor=0.5,
                     ),
                     intended_target_is_on=True,
                     quiet_hours_blocked=False,
@@ -105,7 +117,9 @@ class StateStoreTests(unittest.TestCase):
             with engine.begin() as connection:
                 row = connection.exec_driver_sql(
                     "SELECT site_identifier, decision_action, actuation_status, weather_source, "
-                    "tomorrow_sunshine_hours, night_required_soc_percent, night_surplus_mode_active "
+                    "tomorrow_sunshine_hours, night_required_soc_percent, night_surplus_mode_active, "
+                    "soc_control_mode, effective_turn_on_soc_percent, effective_turn_off_soc_percent, "
+                    "forecast_liberal_factor, power_status_source, power_status_available, power_status_error "
                     "FROM control_cycle"
                 ).first()
             engine.dispose()
@@ -118,6 +132,13 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(row[4], 9.0)
         self.assertEqual(row[5], 72.0)
         self.assertEqual(row[6], 1)
+        self.assertEqual(row[7], "daytime_adaptive")
+        self.assertEqual(row[8], 42.5)
+        self.assertEqual(row[9], 37.5)
+        self.assertEqual(row[10], 0.5)
+        self.assertEqual(row[11], "cerbo_modbus")
+        self.assertEqual(row[12], 0)
+        self.assertEqual(row[13], "timed out")
 
     def test_migration_upgrade_is_idempotent_and_creates_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -140,6 +161,9 @@ class StateStoreTests(unittest.TestCase):
         self.assertIn("ix_control_cycle_site_identifier_timestamp_unix_ms", indexes)
         self.assertIn("ix_control_cycle_command_sent_timestamp_unix_ms", indexes)
         self.assertIn("quiet_hours_forced_off", columns)
+        self.assertIn("consecutive_power_failures", columns)
+        self.assertIn("last_power_failure_at_iso", columns)
+        self.assertIn("last_power_failure_error", columns)
         self.assertIn("battery_alert_below_40_sent", columns)
         self.assertIn("battery_alert_below_35_sent", columns)
         self.assertIn("battery_alert_below_30_sent", columns)
@@ -155,10 +179,17 @@ class StateStoreTests(unittest.TestCase):
         self.assertIn("weather_cache_queried_timezone", columns)
         self.assertIn("weather_cache_cached_at_iso", columns)
         self.assertIn("weather_source", control_cycle_columns)
+        self.assertIn("power_status_source", control_cycle_columns)
+        self.assertIn("power_status_available", control_cycle_columns)
+        self.assertIn("power_status_error", control_cycle_columns)
         self.assertIn("today_sunshine_hours", control_cycle_columns)
         self.assertIn("tomorrow_sunshine_hours", control_cycle_columns)
         self.assertIn("night_required_soc_percent", control_cycle_columns)
         self.assertIn("night_surplus_mode_active", control_cycle_columns)
+        self.assertIn("soc_control_mode", control_cycle_columns)
+        self.assertIn("effective_turn_on_soc_percent", control_cycle_columns)
+        self.assertIn("effective_turn_off_soc_percent", control_cycle_columns)
+        self.assertIn("forecast_liberal_factor", control_cycle_columns)
 
 
 

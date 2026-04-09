@@ -43,6 +43,7 @@ async def main() -> None:
 
     power = payload["power"]
     weather = payload["weather"]
+    power_status = payload["power_status"]
     actuation = payload["actuation"]
 
     print("Pump control cycle")
@@ -52,6 +53,8 @@ async def main() -> None:
     print(f"  Reason: {decision.reason}")
     if payload["quiet_hours_blocked"]:
         print(f"  Blocked: {payload['blocked_reason']}")
+    print(f"  Power status available: {power_status['available']}")
+    print(f"  Power status error: {power_status['error'] or 'none'}")
     print(f"  Battery SOC: {_format_optional_percent(power['battery_soc_percent'])}")
     print(f"  Solar watts: {_format_optional_watts(power['solar_watts'])}")
     print(f"  House watts: {_format_optional_watts(power['house_watts'])}")
@@ -59,6 +62,13 @@ async def main() -> None:
     print(f"  Weather sunshine: {_format_optional_hours(weather['today_sunshine_hours'])}")
     print(f"  Tomorrow sunshine: {_format_optional_hours(weather['tomorrow_sunshine_hours'])}")
     print(f"  Weather current temp: {_format_optional_float(weather['current_temperature_c'])} C")
+    print(
+        "  SOC mode: "
+        f"{payload['soc_control_mode']} | "
+        f"turn-on {_format_optional_percent(payload['effective_turn_on_soc_percent'])} | "
+        f"turn-off {_format_optional_percent(payload['effective_turn_off_soc_percent'])} | "
+        f"forecast factor {_format_optional_float(payload['forecast_liberal_factor'])}"
+    )
     if payload["night_surplus_mode_active"]:
         print(
             "  Night reserve: "

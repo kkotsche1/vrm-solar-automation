@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import smtplib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @dataclass(frozen=True)
@@ -12,6 +14,7 @@ class GmailSmtpNotifier:
     recipients: tuple[str, ...]
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
+    display_timezone: str = "UTC"
 
     def send_plug_state_change_email(
         self,
@@ -25,18 +28,22 @@ class GmailSmtpNotifier:
         observed_after_is_on: bool | None,
         at_iso: str,
     ) -> None:
+        formatted_time = self._format_local_timestamp(at_iso)
+        command_label = self._humanize_command(command_sent)
         self._send_email(
-            subject=f"VRM plug state change: {command_sent}",
-            body_lines=(
-                "The VRM pump controller changed plug state.",
-                f"Timestamp: {at_iso}",
-                f"Decision action: {decision_action}",
-                f"Decision reason: {decision_reason}",
-                f"Intended target: {self._format_bool(intended_is_on)}",
-                f"Command: {command_sent}",
-                f"Actuation status: {actuation_status}",
-                f"Observed before: {self._format_bool(observed_before_is_on)}",
-                f"Observed after: {self._format_bool(observed_after_is_on)}",
+            subject=f"VRM Pump Update: {self._humanize_command_subject(command_sent)}",
+            body_lines=self._build_body(
+                headline="Pump state was updated by automation.",
+                fields=(
+                    ("Time", formatted_time),
+                    ("Action", self._humanize_token(decision_action)),
+                    ("Reason", decision_reason),
+                    ("Requested state", self._format_bool(intended_is_on)),
+                    ("Command sent", command_label),
+                    ("Result", self._humanize_token(actuation_status)),
+                    ("Plug before", self._format_bool(observed_before_is_on)),
+                    ("Plug after", self._format_bool(observed_after_is_on)),
+                ),
             ),
         )
 
@@ -49,12 +56,14 @@ class GmailSmtpNotifier:
     ) -> None:
         thresholds_text = ", ".join(f"{threshold}%" for threshold in crossed_thresholds)
         self._send_email(
-            subject=f"VRM battery alert: {battery_soc_percent:.1f}% SOC",
-            body_lines=(
-                "The VRM battery SOC dropped below the configured alert threshold.",
-                f"Timestamp: {at_iso}",
-                f"Battery SOC: {battery_soc_percent:.1f}%",
-                f"Thresholds crossed this run: {thresholds_text}",
+            subject=f"VRM Alert: Battery SOC low ({battery_soc_percent:.1f}%)",
+            body_lines=self._build_body(
+                headline="Battery SOC dropped below the configured alert thresholds.",
+                fields=(
+                    ("Time", self._format_local_timestamp(at_iso)),
+                    ("Battery SOC", f"{battery_soc_percent:.1f}%"),
+                    ("Thresholds crossed", thresholds_text),
+                ),
             ),
         )
 
@@ -65,11 +74,13 @@ class GmailSmtpNotifier:
         at_iso: str,
     ) -> None:
         self._send_email(
-            subject=f"VRM generator alert: {generator_watts:.0f} W detected",
-            body_lines=(
-                "The VRM controller detected generator power.",
-                f"Timestamp: {at_iso}",
-                f"Generator power: {generator_watts:.0f} W",
+            subject="VRM Alert: Generator power detected",
+            body_lines=self._build_body(
+                headline="Generator power was detected by automation.",
+                fields=(
+                    ("Time", self._format_local_timestamp(at_iso)),
+                    ("Generator power", f"{generator_watts:.0f} W"),
+                ),
             ),
         )
 
@@ -85,17 +96,18 @@ class GmailSmtpNotifier:
         night_reference_sunshine_hours: float | None,
     ) -> None:
         self._send_email(
-            subject=f"VRM weather block alert: automation OFF on {local_date}",
-            body_lines=(
-                "The VRM controller kept the pump OFF due to weather forecast conditions.",
-                f"Timestamp: {at_iso}",
-                f"Local weather date: {local_date}",
-                f"Weather mode: {weather_mode}",
-                f"Decision reason: {decision_reason}",
-                f"Today's sunshine hours: {self._format_hours(today_sunshine_hours)}",
-                f"Tomorrow's sunshine hours: {self._format_hours(tomorrow_sunshine_hours)}",
-                "Night reference sunshine hours: "
-                f"{self._format_hours(night_reference_sunshine_hours)}",
+            subject=f"VRM Update: Automation OFF due to weather ({local_date})",
+            body_lines=self._build_body(
+                headline="Automation stayed OFF because forecast conditions were not favorable.",
+                fields=(
+                    ("Time", self._format_local_timestamp(at_iso)),
+                    ("Date", local_date),
+                    ("Forecast mode", self._humanize_token(weather_mode)),
+                    ("Reason", decision_reason),
+                    ("Today's sunshine", self._format_hours(today_sunshine_hours)),
+                    ("Tomorrow's sunshine", self._format_hours(tomorrow_sunshine_hours)),
+                    ("Night reference sunshine", self._format_hours(night_reference_sunshine_hours)),
+                ),
             ),
         )
 
@@ -119,11 +131,77 @@ class GmailSmtpNotifier:
     @staticmethod
     def _format_bool(value: bool | None) -> str:
         if value is None:
-            return "unknown"
-        return "ON" if value else "OFF"
+            return "Unknown"
+        return "On" if value else "Off"
 
     @staticmethod
     def _format_hours(value: float | None) -> str:
         if value is None:
-            return "unknown"
+            return "n/a"
         return f"{value:.1f} h"
+
+    def _format_local_timestamp(self, at_iso: str) -> str:
+        try:
+            timestamp = datetime.fromisoformat(at_iso)
+        except ValueError:
+            return at_iso
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        return timestamp.astimezone(self._display_zone()).strftime("%Y-%m-%d %H:%M")
+
+    def _display_zone(self):
+        try:
+            return ZoneInfo(self.display_timezone)
+        except ZoneInfoNotFoundError:
+            return UTC
+
+    @staticmethod
+    def _build_body(
+        *,
+        headline: str,
+        fields: tuple[tuple[str, str], ...],
+    ) -> tuple[str, ...]:
+        return (headline, *(f"- {label}: {value}" for label, value in fields))
+
+    @staticmethod
+    def _humanize_command(command_sent: str) -> str:
+        normalized = command_sent.strip().lower()
+        return {
+            "turn_on": "Turn On",
+            "plug_on": "Turn On",
+            "turn_off": "Turn Off",
+            "plug_off": "Turn Off",
+        }.get(normalized, command_sent.replace("_", " ").strip().title())
+
+    @staticmethod
+    def _humanize_command_subject(command_sent: str) -> str:
+        normalized = command_sent.strip().lower()
+        return {
+            "turn_on": "Pump turned ON",
+            "plug_on": "Pump turned ON",
+            "turn_off": "Pump turned OFF",
+            "plug_off": "Pump turned OFF",
+        }.get(normalized, f"Pump command: {command_sent.replace('_', ' ').strip().title()}")
+
+    @staticmethod
+    def _humanize_token(value: str) -> str:
+        normalized = value.strip().lower()
+        mapping = {
+            "turn_on": "Turn On",
+            "turn_off": "Turn Off",
+            "keep_on": "Keep On",
+            "keep_off": "Keep Off",
+            "already_aligned": "Already aligned",
+            "reconciled": "Applied successfully",
+            "command_sent_unverified": "Command sent (pending verification)",
+            "mismatch_after_command": "Final state mismatch",
+            "blocked_quiet_hours": "Blocked by quiet hours",
+            "no_target_change": "No target change",
+            "unreachable": "Plug unreachable",
+            "unknown": "Unknown",
+            "skipped": "Skipped",
+            "insufficient_sun": "Insufficient sunshine forecast",
+            "sufficient_sun": "Sufficient sunshine forecast",
+            "surplus_night": "Surplus night mode",
+        }
+        return mapping.get(normalized, value.replace("_", " ").strip().title())

@@ -51,8 +51,17 @@ class ConfigTests(unittest.TestCase):
             env_path.write_text(
                 "\n".join(
                     [
+                        "CERBO_FETCH_RETRY_COUNT=4",
+                        "CERBO_FETCH_RETRY_DELAY_SECONDS=1.5",
+                        "CERBO_UNAVAILABLE_GRACE_CYCLES=5",
                         "SUNSHINE_HOURS_MIN=4.5",
                         "BATTERY_MIN_SOC_PERCENT=45",
+                        "BATTERY_SOFT_MIN_SOC_PERCENT=35",
+                        "BATTERY_HARD_MIN_SOC_PERCENT=30",
+                        "BATTERY_CAPACITY_KWH=50",
+                        "FORECAST_LIBERAL_SUNSHINE_HOURS_MIN=9.0",
+                        "FORECAST_LIBERAL_SUNSHINE_HOURS_MAX=12.0",
+                        "DAY_MORNING_BIAS_END_LOCAL=11:00",
                     ]
                 )
                 + "\n",
@@ -61,8 +70,17 @@ class ConfigTests(unittest.TestCase):
 
             settings = load_settings(env_path)
 
+        self.assertEqual(settings.cerbo_fetch_retry_count, 4)
+        self.assertEqual(settings.cerbo_fetch_retry_delay_seconds, 1.5)
+        self.assertEqual(settings.cerbo_unavailable_grace_cycles, 5)
         self.assertEqual(settings.sunshine_hours_min, 4.5)
         self.assertEqual(settings.battery_min_soc_percent, 45.0)
+        self.assertEqual(settings.battery_soft_min_soc_percent, 35.0)
+        self.assertEqual(settings.battery_hard_min_soc_percent, 30.0)
+        self.assertEqual(settings.battery_capacity_kwh, 50.0)
+        self.assertEqual(settings.forecast_liberal_sunshine_hours_min, 9.0)
+        self.assertEqual(settings.forecast_liberal_sunshine_hours_max, 12.0)
+        self.assertEqual(settings.day_morning_bias_end_local, "11:00")
 
     def test_load_settings_parses_surplus_night_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -76,6 +94,8 @@ class ConfigTests(unittest.TestCase):
                         "SURPLUS_NIGHT_BUFFER_SOC_PERCENT=6",
                         "SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=12",
                         "SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT=7",
+                        "SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT=8",
+                        "SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT=3",
                         "SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN=9.5",
                     ]
                 )
@@ -91,6 +111,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.surplus_night_buffer_soc_percent, 6.0)
         self.assertEqual(settings.surplus_night_turn_on_margin_soc_percent, 12.0)
         self.assertEqual(settings.surplus_night_turn_off_margin_soc_percent, 7.0)
+        self.assertEqual(settings.surplus_night_min_turn_on_margin_soc_percent, 8.0)
+        self.assertEqual(settings.surplus_night_min_turn_off_margin_soc_percent, 3.0)
         self.assertEqual(settings.surplus_night_next_day_sunshine_min, 9.5)
 
     def test_load_settings_rejects_invalid_sunshine_hours_threshold(self) -> None:
@@ -105,6 +127,49 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text("BATTERY_MIN_SOC_PERCENT=110\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                load_settings(env_path)
+
+    def test_load_settings_rejects_invalid_cerbo_retry_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("CERBO_FETCH_RETRY_COUNT=abc\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                load_settings(env_path)
+
+    def test_load_settings_rejects_invalid_soc_threshold_ordering(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "BATTERY_MIN_SOC_PERCENT=45",
+                        "BATTERY_SOFT_MIN_SOC_PERCENT=35",
+                        "BATTERY_HARD_MIN_SOC_PERCENT=36",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                load_settings(env_path)
+
+    def test_load_settings_rejects_invalid_liberal_forecast_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "FORECAST_LIBERAL_SUNSHINE_HOURS_MIN=12",
+                        "FORECAST_LIBERAL_SUNSHINE_HOURS_MAX=9",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             with self.assertRaises(ValueError):
                 load_settings(env_path)

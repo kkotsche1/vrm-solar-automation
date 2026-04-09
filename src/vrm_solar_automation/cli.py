@@ -179,12 +179,15 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
 
     power = payload["power"]
     weather = payload["weather"]
+    power_status = payload["power_status"]
     print(f"Decision: {decision.action}")
     print("Automatic target: ON" if decision.should_turn_on else "Automatic target: OFF")
     print("Plug target: ON" if payload["intended_target_is_on"] else "Plug target: OFF")
     print(f"Why: {decision.reason}")
     if payload["quiet_hours_blocked"]:
         print(f"Blocked: {payload['blocked_reason']}")
+    if not power_status["available"]:
+        print(f"Power telemetry: unavailable ({power_status['error'] or 'unknown error'})")
     print(
         f"Battery {_format_optional_percent(power['battery_soc_percent'])} | "
         f"Solar {_format_optional_watts(power['solar_watts'])} | "
@@ -194,6 +197,13 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
         print(f"Generator watts: {power['generator_watts']:.0f} W")
     print(f"Weather today: {_format_weather_summary(weather)}")
     print(f"Weather tomorrow sunshine: {_format_optional_hours(weather['tomorrow_sunshine_hours'])}")
+    print(
+        "SOC mode: "
+        f"{payload['soc_control_mode']} | "
+        f"turn-on {_format_optional_percent(payload['effective_turn_on_soc_percent'])} | "
+        f"turn-off {_format_optional_percent(payload['effective_turn_off_soc_percent'])} | "
+        f"forecast factor {_format_optional_float(payload['forecast_liberal_factor'])}"
+    )
     if payload["night_surplus_mode_active"]:
         print(
             "Night reserve: "
@@ -213,6 +223,7 @@ async def _run_control(env_file: str, as_json: bool) -> int:
 
     power = payload["power"]
     weather = payload["weather"]
+    power_status = payload["power_status"]
     actuation = payload["actuation"]
     print(f"Decision: {decision.action}")
     print("Automatic target: ON" if decision.should_turn_on else "Automatic target: OFF")
@@ -220,6 +231,8 @@ async def _run_control(env_file: str, as_json: bool) -> int:
     print(f"Why: {decision.reason}")
     if payload["quiet_hours_blocked"]:
         print(f"Blocked: {payload['blocked_reason']}")
+    if not power_status["available"]:
+        print(f"Power telemetry: unavailable ({power_status['error'] or 'unknown error'})")
     print(
         f"Battery {_format_optional_percent(power['battery_soc_percent'])} | "
         f"Solar {_format_optional_watts(power['solar_watts'])} | "
@@ -229,6 +242,13 @@ async def _run_control(env_file: str, as_json: bool) -> int:
         print(f"Generator watts: {power['generator_watts']:.0f} W")
     print(f"Weather today: {_format_weather_summary(weather)}")
     print(f"Weather tomorrow sunshine: {_format_optional_hours(weather['tomorrow_sunshine_hours'])}")
+    print(
+        "SOC mode: "
+        f"{payload['soc_control_mode']} | "
+        f"turn-on {_format_optional_percent(payload['effective_turn_on_soc_percent'])} | "
+        f"turn-off {_format_optional_percent(payload['effective_turn_off_soc_percent'])} | "
+        f"forecast factor {_format_optional_float(payload['forecast_liberal_factor'])}"
+    )
     if payload["night_surplus_mode_active"]:
         print(
             "Night reserve: "

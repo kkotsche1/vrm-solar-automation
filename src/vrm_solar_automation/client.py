@@ -25,6 +25,9 @@ class VrmProbeClient:
         try:
             return await CerboProbeClient(self._settings.cerbo_settings()).fetch_snapshot()
         except (OSError, TimeoutError, RuntimeError) as exc:
+            detail = str(exc)
+            suffix = f" Details: {detail}" if detail else ""
             raise ProbeUnavailableError(
                 f"Unable to reach Cerbo GX at {self._settings.cerbo_host}:{self._settings.cerbo_port}."
+                f"{suffix}"
             ) from exc

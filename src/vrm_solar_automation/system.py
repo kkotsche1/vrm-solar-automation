@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
@@ -14,7 +15,14 @@ from .config import Settings
 from .db import upgrade_database
 from .models import PowerSnapshot
 from .notifier import GmailSmtpNotifier
-from .policy import PumpDecision, PumpPolicy, PumpPolicyConfig, PumpPolicyState
+from .policy import (
+    PumpDecision,
+    PumpPolicy,
+    PumpPolicyConfig,
+    PumpPolicyState,
+    forecast_liberal_factor,
+    linear_interpolate,
+)
 from .shelly import ShellyError, ShellyPlugClient
 from .state import StateStore
 from .weather import OpenMeteoClient, WeatherSnapshot
@@ -34,6 +42,7 @@ class StateRepository(Protocol):
         power: dict[str, object],
         weather: dict[str, object],
         weather_source: str,
+        power_status: dict[str, object],
         decision: PumpDecision,
         intended_target_is_on: bool,
         quiet_hours_blocked: bool,
@@ -89,7 +98,13 @@ class PumpControlSystem:
             upgrade_database(settings.database_url)
         policy_config = PumpPolicyConfig(
             battery_min_soc=settings.battery_min_soc_percent,
+            battery_soft_min_soc=settings.battery_soft_min_soc_percent,
+            battery_hard_min_soc=settings.battery_hard_min_soc_percent,
             sunshine_hours_min=settings.sunshine_hours_min,
+            forecast_liberal_sunshine_hours_min=settings.forecast_liberal_sunshine_hours_min,
+            forecast_liberal_sunshine_hours_max=settings.forecast_liberal_sunshine_hours_max,
+            auto_resume_start_local=settings.auto_resume_start_local,
+            day_morning_bias_end_local=settings.day_morning_bias_end_local,
         )
         self._policy = policy or PumpPolicy(policy_config)
         self._generator_alert_threshold_watts = policy_config.generator_on_block_watts
@@ -106,6 +121,7 @@ class PumpControlSystem:
                 sender=settings.smtp_gmail_sender,
                 app_password=settings.smtp_gmail_app_password,
                 recipients=settings.smtp_gmail_recipients,
+                display_timezone=settings.auto_control_timezone,
             )
         else:
             self._notifier = None
@@ -124,8 +140,20 @@ class PumpControlSystem:
         self._surplus_night_turn_off_margin_soc_percent = (
             settings.surplus_night_turn_off_margin_soc_percent
         )
+        self._surplus_night_min_turn_on_margin_soc_percent = (
+            settings.surplus_night_min_turn_on_margin_soc_percent
+        )
+        self._surplus_night_min_turn_off_margin_soc_percent = (
+            settings.surplus_night_min_turn_off_margin_soc_percent
+        )
         self._surplus_night_next_day_sunshine_min = settings.surplus_night_next_day_sunshine_min
-        self._battery_capacity_kwh = 50.0
+        self._battery_capacity_kwh = settings.battery_capacity_kwh
+        self._battery_hard_min_soc_percent = settings.battery_hard_min_soc_percent
+        self._forecast_liberal_sunshine_hours_min = settings.forecast_liberal_sunshine_hours_min
+        self._forecast_liberal_sunshine_hours_max = settings.forecast_liberal_sunshine_hours_max
+        self._cerbo_fetch_retry_count = settings.cerbo_fetch_retry_count
+        self._cerbo_fetch_retry_delay_seconds = settings.cerbo_fetch_retry_delay_seconds
+        self._cerbo_unavailable_grace_cycles = settings.cerbo_unavailable_grace_cycles
         self._weather_cache_date: date | None = None
         self._weather_cache_snapshot: WeatherSnapshot | None = None
 
@@ -162,9 +190,10 @@ class PumpControlSystem:
             previous_state,
             next_state,
             quiet_hours_forced_off,
-        ) = self._evaluate_policy_with_inputs(
+        ) = self._evaluate_controller_state(
             power=power,
             weather=weather,
+            power_status=power_status,
         )
         intended_is_on = self._intended_target_is_on(next_state.is_on, quiet_hours_forced_off)
         quiet_hours_blocked = quiet_hours_forced_off and next_state.is_on
@@ -195,9 +224,10 @@ class PumpControlSystem:
             previous_state,
             next_state,
             quiet_hours_forced_off,
-        ) = self._evaluate_policy_with_inputs(
+        ) = self._evaluate_controller_state(
             power=power,
             weather=weather,
+            power_status=power_status,
         )
         intended_is_on = self._intended_target_is_on(next_state.is_on, quiet_hours_forced_off)
         quiet_hours_blocked = quiet_hours_forced_off and next_state.is_on
@@ -250,6 +280,7 @@ class PumpControlSystem:
             power=payload["power"],
             weather=payload["weather"],
             weather_source=weather_source,
+            power_status=payload["power_status"],
             decision=decision,
             intended_target_is_on=bool(payload["intended_target_is_on"]),
             quiet_hours_blocked=bool(payload["quiet_hours_blocked"]),
@@ -258,11 +289,12 @@ class PumpControlSystem:
         )
         return decision, payload
 
-    def _evaluate_policy_with_inputs(
+    def _evaluate_controller_state(
         self,
         *,
         power: PowerSnapshot,
         weather: WeatherSnapshot,
+        power_status: TelemetryStatus,
     ) -> tuple[
         PumpDecision,
         PumpPolicyState | None,
@@ -270,13 +302,39 @@ class PumpControlSystem:
         bool,
     ]:
         previous_state = self._state_store.load()
+        if power_status.available:
+            return self._evaluate_policy_with_inputs(
+                power=power,
+                weather=weather,
+                previous_state=previous_state,
+                power_status=power_status,
+            )
+        return self._evaluate_unavailable_power(
+            previous_state=previous_state,
+            power_status=power_status,
+        )
+
+    def _evaluate_policy_with_inputs(
+        self,
+        *,
+        power: PowerSnapshot,
+        weather: WeatherSnapshot,
+        previous_state: PumpPolicyState | None,
+        power_status: TelemetryStatus,
+    ) -> tuple[
+        PumpDecision,
+        PumpPolicyState | None,
+        PumpPolicyState,
+        bool,
+    ]:
         quiet_hours_forced_off = False
+        local_now = self._local_now()
         decision = self._policy.decide(
             power=power,
             weather=weather,
             previous_state=previous_state,
+            now=local_now,
         )
-        local_now = self._local_now()
         if self._is_within_quiet_hours(local_now=local_now):
             if self._surplus_night_enabled:
                 decision = self._decide_surplus_night(
@@ -292,45 +350,163 @@ class PumpControlSystem:
             decision.should_turn_on,
             quiet_hours_forced_off=quiet_hours_forced_off,
         )
+        next_state = self._with_power_status(next_state, power_status=power_status)
         return decision, previous_state, next_state, quiet_hours_forced_off
 
     async def _fetch_power(self) -> tuple[PowerSnapshot, TelemetryStatus]:
         power_source = getattr(self._probe_client, "source", "cerbo_modbus")
-        try:
-            return (
-                await self._probe_client.fetch_snapshot(),
-                TelemetryStatus(
-                    source=power_source,
-                    available=True,
-                    error=None,
-                ),
-            )
-        except (ProbeUnavailableError, OSError, TimeoutError, RuntimeError) as exc:
-            error_message = str(exc)
-            if not isinstance(exc, ProbeUnavailableError):
-                suffix = f" Details: {error_message}" if error_message else ""
-                error_message = (
-                    f"Unable to reach Cerbo GX at {self._settings.cerbo_host}:{self._settings.cerbo_port}."
-                    f"{suffix}"
+        attempts = max(1, self._cerbo_fetch_retry_count + 1)
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return (
+                    await self._probe_client.fetch_snapshot(),
+                    TelemetryStatus(
+                        source=power_source,
+                        available=True,
+                        error=None,
+                    ),
                 )
-            return (
-                PowerSnapshot.with_timestamp(
-                    site_id=self._settings.site_id or 0,
-                    site_name=self._settings.cerbo_site_name,
-                    site_identifier=self._settings.cerbo_site_identifier,
-                    battery_soc_percent=None,
-                    solar_watts=None,
-                    house_watts=None,
-                    generator_watts=None,
-                    active_input_source=None,
-                    queried_at_unix_ms=None,
-                ),
-                TelemetryStatus(
-                    source=power_source,
-                    available=False,
-                    error=error_message,
-                ),
+            except (ProbeUnavailableError, OSError, TimeoutError, RuntimeError) as exc:
+                last_error = self._format_power_error(exc)
+                LOGGER.warning(
+                    "Cerbo power fetch attempt %s/%s failed: %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts and self._cerbo_fetch_retry_delay_seconds > 0:
+                    await asyncio.sleep(self._cerbo_fetch_retry_delay_seconds)
+
+        return (
+            self._unavailable_power_snapshot(),
+            TelemetryStatus(
+                source=power_source,
+                available=False,
+                error=last_error,
+            ),
+        )
+
+    def _evaluate_unavailable_power(
+        self,
+        *,
+        previous_state: PumpPolicyState | None,
+        power_status: TelemetryStatus,
+    ) -> tuple[
+        PumpDecision,
+        PumpPolicyState | None,
+        PumpPolicyState,
+        bool,
+    ]:
+        local_now = self._local_now()
+        quiet_hours_forced_off = (
+            self._is_within_quiet_hours(local_now=local_now) and not self._surplus_night_enabled
+        )
+        next_failure_count = (previous_state.consecutive_power_failures if previous_state else 0) + 1
+        previous_target_is_on = previous_state.is_on if previous_state is not None else False
+        grace_limit = max(0, self._cerbo_unavailable_grace_cycles)
+
+        if previous_target_is_on and next_failure_count < grace_limit:
+            reason = (
+                "Cerbo telemetry is unavailable after retries; holding the previous automatic ON "
+                f"target (failure {next_failure_count}/{grace_limit})."
             )
+            decision = self._telemetry_decision(
+                target_on=True,
+                previous_state=previous_state,
+                reason=reason,
+            )
+        elif previous_target_is_on and grace_limit > 0 and next_failure_count >= grace_limit:
+            reason = (
+                "Cerbo telemetry is unavailable after retries, and the failure count reached "
+                f"{next_failure_count}/{grace_limit}, so the pump fails safe to off."
+            )
+            decision = self._telemetry_decision(
+                target_on=False,
+                previous_state=previous_state,
+                reason=reason,
+            )
+        else:
+            reason = "Cerbo telemetry is unavailable after retries, so the controller keeps the pump off."
+            decision = self._telemetry_decision(
+                target_on=False,
+                previous_state=previous_state,
+                reason=reason,
+            )
+
+        next_state = StateStore.from_decision(
+            previous_state,
+            decision.should_turn_on,
+            quiet_hours_forced_off=quiet_hours_forced_off,
+        )
+        next_state = self._with_power_status(next_state, power_status=power_status)
+        return decision, previous_state, next_state, quiet_hours_forced_off
+
+    def _telemetry_decision(
+        self,
+        *,
+        target_on: bool,
+        previous_state: PumpPolicyState | None,
+        reason: str,
+    ) -> PumpDecision:
+        return PumpDecision(
+            should_turn_on=target_on,
+            action=self._action(target_on=target_on, previous_state=previous_state),
+            reason=reason,
+            reasons=[reason],
+            weather_mode="telemetry_unavailable",
+            soc_control_mode="telemetry_hold",
+        )
+
+    def _with_power_status(
+        self,
+        state: PumpPolicyState,
+        *,
+        power_status: TelemetryStatus,
+    ) -> PumpPolicyState:
+        if power_status.available:
+            return replace(
+                state,
+                consecutive_power_failures=0,
+            )
+
+        return replace(
+            state,
+            consecutive_power_failures=state.consecutive_power_failures + 1,
+            last_power_failure_at_iso=datetime.now(UTC).isoformat(),
+            last_power_failure_error=power_status.error,
+        )
+
+    @staticmethod
+    def _action(*, target_on: bool, previous_state: PumpPolicyState | None) -> str:
+        if previous_state is None:
+            return "turn_on" if target_on else "turn_off"
+        if previous_state.is_on == target_on:
+            return "keep_on" if target_on else "keep_off"
+        return "turn_on" if target_on else "turn_off"
+
+    def _unavailable_power_snapshot(self) -> PowerSnapshot:
+        return PowerSnapshot.with_timestamp(
+            site_id=self._settings.site_id or 0,
+            site_name=self._settings.cerbo_site_name,
+            site_identifier=self._settings.cerbo_site_identifier,
+            battery_soc_percent=None,
+            solar_watts=None,
+            house_watts=None,
+            generator_watts=None,
+            active_input_source=None,
+            queried_at_unix_ms=None,
+        )
+
+    def _format_power_error(self, exc: Exception) -> str:
+        error_message = str(exc)
+        if isinstance(exc, ProbeUnavailableError):
+            return error_message
+        suffix = f" Details: {error_message}" if error_message else ""
+        return (
+            f"Unable to reach Cerbo GX at {self._settings.cerbo_host}:{self._settings.cerbo_port}."
+            f"{suffix}"
+        )
 
     async def _fetch_weather(self) -> WeatherFetchResult:
         today = self._weather_local_date()
@@ -691,9 +867,33 @@ class PumpControlSystem:
             weather=weather,
             local_now=local_now,
         )
-        turn_on_threshold = required_soc + self._surplus_night_turn_on_margin_soc_percent
-        turn_off_threshold = required_soc + self._surplus_night_turn_off_margin_soc_percent
         previous_target_is_on = previous_state.is_on if previous_state is not None else False
+        liberal_factor = forecast_liberal_factor(
+            reference_sunshine,
+            liberal_sunshine_hours_min=self._forecast_liberal_sunshine_hours_min,
+            liberal_sunshine_hours_max=self._forecast_liberal_sunshine_hours_max,
+        )
+        turn_on_threshold = None
+        turn_off_threshold = None
+        if liberal_factor is not None:
+            turn_on_margin = linear_interpolate(
+                self._surplus_night_turn_on_margin_soc_percent,
+                self._surplus_night_min_turn_on_margin_soc_percent,
+                liberal_factor,
+            )
+            turn_off_margin = linear_interpolate(
+                self._surplus_night_turn_off_margin_soc_percent,
+                self._surplus_night_min_turn_off_margin_soc_percent,
+                liberal_factor,
+            )
+            turn_on_threshold = max(
+                self._battery_hard_min_soc_percent,
+                required_soc + turn_on_margin,
+            )
+            turn_off_threshold = max(
+                self._battery_hard_min_soc_percent,
+                required_soc + turn_off_margin,
+            )
 
         if battery_soc is None:
             return self._night_decision(
@@ -701,6 +901,9 @@ class PumpControlSystem:
                 previous_state=previous_state,
                 required_soc=required_soc,
                 reference_sunshine=reference_sunshine,
+                effective_turn_on_soc_percent=turn_on_threshold,
+                effective_turn_off_soc_percent=turn_off_threshold,
+                forecast_liberal_factor=liberal_factor,
                 reason="Battery SOC is unavailable, so reserve-aware night control fails safe to off.",
             )
 
@@ -710,6 +913,9 @@ class PumpControlSystem:
                 previous_state=previous_state,
                 required_soc=required_soc,
                 reference_sunshine=reference_sunshine,
+                effective_turn_on_soc_percent=turn_on_threshold,
+                effective_turn_off_soc_percent=turn_off_threshold,
+                forecast_liberal_factor=liberal_factor,
                 reason=(
                     f"Generator power is present at {generator_watts:.0f} W, so reserve-aware night "
                     "control keeps the pump off."
@@ -722,6 +928,9 @@ class PumpControlSystem:
                 previous_state=previous_state,
                 required_soc=required_soc,
                 reference_sunshine=reference_sunshine,
+                effective_turn_on_soc_percent=None,
+                effective_turn_off_soc_percent=None,
+                forecast_liberal_factor=None,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine-hours forecast is unavailable, so "
                     "reserve-aware night control keeps the pump off."
@@ -734,6 +943,9 @@ class PumpControlSystem:
                 previous_state=previous_state,
                 required_soc=required_soc,
                 reference_sunshine=reference_sunshine,
+                effective_turn_on_soc_percent=turn_on_threshold,
+                effective_turn_off_soc_percent=turn_off_threshold,
+                forecast_liberal_factor=liberal_factor,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine forecast is {reference_sunshine:.1f} hours, "
                     f"below the {self._surplus_night_next_day_sunshine_min:.1f}-hour surplus-night minimum, "
@@ -748,6 +960,9 @@ class PumpControlSystem:
                     previous_state=previous_state,
                     required_soc=required_soc,
                     reference_sunshine=reference_sunshine,
+                    effective_turn_on_soc_percent=turn_on_threshold,
+                    effective_turn_off_soc_percent=turn_off_threshold,
+                    forecast_liberal_factor=liberal_factor,
                     reason=(
                         f"Reserve-aware night control needs at least {turn_off_threshold:.1f}% SOC to keep "
                         f"running, and battery SOC is {battery_soc:.1f}%, so the pump turns off."
@@ -758,6 +973,9 @@ class PumpControlSystem:
                 previous_state=previous_state,
                 required_soc=required_soc,
                 reference_sunshine=reference_sunshine,
+                effective_turn_on_soc_percent=turn_on_threshold,
+                effective_turn_off_soc_percent=turn_off_threshold,
+                forecast_liberal_factor=liberal_factor,
                 reason=(
                     f"Reserve-aware night control stays on because {reference_label}'s sunshine forecast is "
                     f"{reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, above the "
@@ -771,6 +989,9 @@ class PumpControlSystem:
                 previous_state=previous_state,
                 required_soc=required_soc,
                 reference_sunshine=reference_sunshine,
+                effective_turn_on_soc_percent=turn_on_threshold,
+                effective_turn_off_soc_percent=turn_off_threshold,
+                forecast_liberal_factor=liberal_factor,
                 reason=(
                     f"Reserve-aware night control needs at least {turn_on_threshold:.1f}% SOC to turn on, "
                     f"and battery SOC is {battery_soc:.1f}%, so the pump stays off."
@@ -782,6 +1003,9 @@ class PumpControlSystem:
             previous_state=previous_state,
             required_soc=required_soc,
             reference_sunshine=reference_sunshine,
+            effective_turn_on_soc_percent=turn_on_threshold,
+            effective_turn_off_soc_percent=turn_off_threshold,
+            forecast_liberal_factor=liberal_factor,
             reason=(
                 f"Reserve-aware night control can run because {reference_label}'s sunshine forecast is "
                 f"{reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, meeting the "
@@ -796,6 +1020,9 @@ class PumpControlSystem:
         previous_state: PumpPolicyState | None,
         required_soc: float,
         reference_sunshine: float | None,
+        effective_turn_on_soc_percent: float | None,
+        effective_turn_off_soc_percent: float | None,
+        forecast_liberal_factor: float | None,
         reason: str,
     ) -> PumpDecision:
         return PumpDecision(
@@ -804,9 +1031,13 @@ class PumpControlSystem:
             reason=reason,
             reasons=[reason],
             weather_mode="surplus_night",
+            soc_control_mode="surplus_night",
             night_required_soc_percent=required_soc,
             night_reference_sunshine_hours=reference_sunshine,
             night_surplus_mode_active=True,
+            effective_turn_on_soc_percent=effective_turn_on_soc_percent,
+            effective_turn_off_soc_percent=effective_turn_off_soc_percent,
+            forecast_liberal_factor=forecast_liberal_factor,
         )
 
     def _night_reference_sunshine(
@@ -875,6 +1106,10 @@ class PumpControlSystem:
             "night_required_soc_percent": decision.night_required_soc_percent,
             "night_reference_sunshine_hours": decision.night_reference_sunshine_hours,
             "night_surplus_mode_active": decision.night_surplus_mode_active,
+            "effective_turn_on_soc_percent": decision.effective_turn_on_soc_percent,
+            "effective_turn_off_soc_percent": decision.effective_turn_off_soc_percent,
+            "forecast_liberal_factor": decision.forecast_liberal_factor,
+            "soc_control_mode": decision.soc_control_mode,
         }
 
     def _previous_intended_target_is_on(self, state: PumpPolicyState | None) -> bool | None:

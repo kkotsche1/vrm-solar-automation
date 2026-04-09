@@ -18,16 +18,27 @@ from vrm_solar_automation.weather import WeatherSnapshot
 
 
 class FakeProbeClient:
-    def __init__(self, snapshot: PowerSnapshot | list[PowerSnapshot]) -> None:
+    source = "cerbo_modbus"
+
+    def __init__(
+        self,
+        snapshot: PowerSnapshot | Exception | list[PowerSnapshot | Exception],
+    ) -> None:
         if isinstance(snapshot, list):
             self._snapshots = list(snapshot)
         else:
             self._snapshots = [snapshot]
+        self.fetch_calls = 0
 
     async def fetch_snapshot(self) -> PowerSnapshot:
+        self.fetch_calls += 1
         if len(self._snapshots) == 1:
-            return self._snapshots[0]
-        return self._snapshots.pop(0)
+            current = self._snapshots[0]
+        else:
+            current = self._snapshots.pop(0)
+        if isinstance(current, Exception):
+            raise current
+        return current
 
 
 class FakeWeatherClient:
@@ -59,6 +70,8 @@ class FakeAlwaysFailWeatherClient:
 
 
 class FakeUnavailableProbeClient:
+    source = "cerbo_modbus"
+
     async def fetch_snapshot(self) -> PowerSnapshot:
         raise TimeoutError("timed out")
 
@@ -252,13 +265,13 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.weather_mode, "insufficient_sun")
         self.assertIn("below the 6.5-hour minimum", decision.reason)
 
-    def test_soc_at_minimum_keeps_operation_off(self) -> None:
+    def test_hard_soc_cutoff_keeps_operation_off(self) -> None:
         previous_state = PumpPolicyState(
             is_on=True,
             changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
         )
         decision = PumpPolicy().decide(
-            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=55.0),
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=30.0),
             weather=_build_sunny_weather(),
             previous_state=previous_state,
             now=datetime(2026, 1, 10, tzinfo=UTC),
@@ -266,7 +279,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(decision.should_turn_on)
         self.assertEqual(decision.action, "turn_off")
-        self.assertIn("at or below the 55.0% minimum", decision.reason)
+        self.assertIn("at or below the 30.0% hard automatic cutoff", decision.reason)
 
     async def test_control_uses_configured_soc_threshold(self) -> None:
         system = PumpControlSystem(
@@ -276,7 +289,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=46.0)
             ),
-            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=9.0)),
             state_store=FakeStateStore(),
         )
 
@@ -284,7 +297,134 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(decision.should_turn_on)
         self.assertTrue(payload["next_state"]["is_on"])
-        self.assertIn("46.0%, above the 45.0% minimum run threshold", decision.reason)
+        self.assertIn("meeting the adaptive 45.0% turn-on threshold", decision.reason)
+
+    async def test_morning_resume_keeps_running_at_40_percent_with_strong_forecast(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, 8, 29, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(
+                battery_min_soc_percent=45.0,
+                auto_off_start_local="18:30",
+                auto_resume_start_local="08:30",
+                day_morning_bias_end_local="11:00",
+                auto_control_timezone="UTC",
+                surplus_night_enabled=False,
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=40.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.5)),
+            state_store=state_store,
+            now_provider=_fixed_now(2026, 1, 10, 8, 31),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(decision.action, "keep_on")
+        self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 37.5, places=1)
+        self.assertAlmostEqual(float(payload["forecast_liberal_factor"]), 0.5, places=2)
+
+    async def test_morning_resume_strong_forecast_can_restart_below_conservative_cutoff(self) -> None:
+        system = PumpControlSystem(
+            _test_settings(
+                battery_min_soc_percent=45.0,
+                auto_resume_start_local="08:30",
+                day_morning_bias_end_local="11:00",
+                auto_control_timezone="UTC",
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=43.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.5)),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 10, 8, 45),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertAlmostEqual(float(payload["effective_turn_on_soc_percent"]), 42.5, places=1)
+        self.assertIn("meeting the adaptive 42.5% turn-on threshold", decision.reason)
+
+    async def test_morning_resume_weak_forecast_keeps_conservative_daytime_cutoff(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, 8, 29, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(
+                battery_min_soc_percent=45.0,
+                auto_resume_start_local="08:30",
+                day_morning_bias_end_local="11:00",
+                auto_control_timezone="UTC",
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=40.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=9.0)),
+            state_store=state_store,
+            now_provider=_fixed_now(2026, 1, 10, 8, 31),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 45.0, places=1)
+        self.assertIn("needs at least 45.0% SOC to keep running", decision.reason)
+
+    async def test_morning_bias_ends_after_configured_time(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, 8, 29, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(
+                battery_min_soc_percent=45.0,
+                auto_resume_start_local="08:30",
+                day_morning_bias_end_local="11:00",
+                auto_control_timezone="UTC",
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=39.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.5)),
+            state_store=state_store,
+            now_provider=_fixed_now(2026, 1, 10, 11, 1),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 40.0, places=1)
+        self.assertIn("needs at least 40.0% SOC to keep running", decision.reason)
+
+    async def test_daytime_hard_cutoff_overrides_strong_forecast(self) -> None:
+        system = PumpControlSystem(
+            _test_settings(
+                battery_min_soc_percent=45.0,
+                auto_resume_start_local="08:30",
+                day_morning_bias_end_local="11:00",
+                auto_control_timezone="UTC",
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=30.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=12.0)),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 10, 9, 0),
+        )
+
+        decision, _ = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertIn("30.0% hard automatic cutoff", decision.reason)
 
     async def test_control_uses_configured_sunshine_threshold(self) -> None:
         system = PumpControlSystem(
@@ -364,10 +504,140 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         decision, payload = await system.evaluate()
 
         self.assertFalse(payload["power_status"]["available"])
-        self.assertIn("Cerbo GX", payload["power_status"]["error"])
+        self.assertIn("Unable to reach Cerbo GX", payload["power_status"]["error"])
+        self.assertIn("timed out", payload["power_status"]["error"])
         self.assertIsNone(payload["power"]["battery_soc_percent"])
         self.assertFalse(decision.should_turn_on)
-        self.assertIn("Battery SOC is unavailable", payload["decision"]["reason"])
+        self.assertIn("Cerbo telemetry is unavailable after retries", payload["decision"]["reason"])
+        self.assertEqual(payload["soc_control_mode"], "telemetry_hold")
+        self.assertEqual(payload["next_state"]["consecutive_power_failures"], 1)
+
+    async def test_power_fetch_retry_recovers_within_same_cycle(self) -> None:
+        probe_client = FakeProbeClient(
+            [
+                TimeoutError("transient timeout"),
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
+            ]
+        )
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=probe_client,
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=FakeStateStore(),
+        )
+
+        decision, payload = await system.control()
+
+        self.assertEqual(probe_client.fetch_calls, 2)
+        self.assertTrue(payload["power_status"]["available"])
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(payload["next_state"]["consecutive_power_failures"], 0)
+
+    async def test_first_failed_cycle_holds_previous_on_target(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+            last_known_plug_is_on=True,
+            last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(TimeoutError("timed out")),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            plug_client=FakePlugClient(status_outputs=[True]),
+            state_store=state_store,
+        )
+
+        decision, payload = await system.control()
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(decision.action, "keep_on")
+        self.assertEqual(payload["soc_control_mode"], "telemetry_hold")
+        self.assertEqual(payload["actuation"]["status"], "no_target_change")
+        self.assertIsNone(payload["actuation"]["command_sent"])
+        self.assertEqual(payload["next_state"]["consecutive_power_failures"], 1)
+        self.assertIn("holding the previous automatic ON target (failure 1/3)", decision.reason)
+
+    async def test_third_consecutive_failed_cycle_forces_off(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+            consecutive_power_failures=0,
+            last_known_plug_is_on=True,
+            last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(TimeoutError("timed out")),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            plug_client=FakePlugClient(status_outputs=[True, True, True, False]),
+            state_store=state_store,
+        )
+
+        first_decision, first_payload = await system.control()
+        second_decision, second_payload = await system.control()
+        third_decision, third_payload = await system.control()
+
+        self.assertTrue(first_decision.should_turn_on)
+        self.assertTrue(second_decision.should_turn_on)
+        self.assertFalse(third_decision.should_turn_on)
+        self.assertEqual(first_payload["next_state"]["consecutive_power_failures"], 1)
+        self.assertEqual(second_payload["next_state"]["consecutive_power_failures"], 2)
+        self.assertEqual(third_payload["next_state"]["consecutive_power_failures"], 3)
+        self.assertEqual(third_payload["actuation"]["status"], "reconciled")
+        self.assertEqual(third_payload["actuation"]["command_sent"], "turn_off")
+        self.assertIn("failure count reached 3/3", third_decision.reason)
+
+    async def test_failed_cycle_with_previous_off_state_stays_off(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=False,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+            last_known_plug_is_on=False,
+            last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(TimeoutError("timed out")),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            plug_client=FakePlugClient(status_outputs=[False]),
+            state_store=state_store,
+        )
+
+        decision, payload = await system.control()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertEqual(decision.action, "keep_off")
+        self.assertEqual(payload["actuation"]["status"], "no_target_change")
+        self.assertIsNone(payload["actuation"]["command_sent"])
+        self.assertEqual(payload["next_state"]["consecutive_power_failures"], 1)
+
+    async def test_successful_cycle_resets_failure_streak(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+            consecutive_power_failures=2,
+            last_power_failure_at_iso=datetime(2026, 1, 10, 10, tzinfo=UTC).isoformat(),
+            last_power_failure_error="timed out",
+            last_known_plug_is_on=True,
+            last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            plug_client=FakePlugClient(status_outputs=[True]),
+            state_store=state_store,
+        )
+
+        decision, payload = await system.control()
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(payload["next_state"]["consecutive_power_failures"], 0)
+        self.assertEqual(payload["next_state"]["last_power_failure_error"], "timed out")
 
     async def test_evaluate_uses_mock_cerbo_snapshot_when_enabled(self) -> None:
         system = PumpControlSystem(
@@ -565,7 +835,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 surplus_night_enabled=True,
             ),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=78.0)
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=77.0)
             ),
             weather_client=FakeWeatherClient(
                 _build_sunny_weather(today_sunshine_hours=6.0, tomorrow_sunshine_hours=10.0)
@@ -579,7 +849,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.should_turn_on)
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertFalse(payload["intended_target_is_on"])
-        self.assertIn("needs at least 79.0% SOC to turn on", decision.reason)
+        self.assertIn("needs at least 78.0% SOC to turn on", decision.reason)
 
     async def test_surplus_night_can_turn_on_after_midnight_with_lower_reserve(self) -> None:
         system = PumpControlSystem(
@@ -633,7 +903,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.should_turn_on)
         self.assertEqual(decision.action, "keep_on")
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertIn("above the 74.0% keep-running threshold", decision.reason)
+        self.assertIn("above the 73.0% keep-running threshold", decision.reason)
 
     async def test_surplus_night_turns_off_when_soc_reaches_off_threshold(self) -> None:
         state_store = FakeStateStore()
@@ -648,7 +918,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 surplus_night_enabled=True,
             ),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=74.0)
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=73.0)
             ),
             weather_client=FakeWeatherClient(
                 _build_sunny_weather(today_sunshine_hours=6.0, tomorrow_sunshine_hours=10.0)
@@ -662,7 +932,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.should_turn_on)
         self.assertEqual(decision.action, "turn_off")
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertIn("needs at least 74.0% SOC to keep running", decision.reason)
+        self.assertIn("needs at least 73.0% SOC to keep running", decision.reason)
 
     async def test_surplus_night_generator_override_keeps_pump_off(self) -> None:
         system = PumpControlSystem(
@@ -991,7 +1261,8 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT COUNT(*) FROM controller_state"
                 ).scalar_one()
                 cycle_row = connection.exec_driver_sql(
-                    "SELECT should_turn_on, actuation_status, actuation_command_sent, weather_source "
+                    "SELECT should_turn_on, actuation_status, actuation_command_sent, weather_source, "
+                    "power_status_available, power_status_error "
                     "FROM control_cycle ORDER BY id DESC LIMIT 1"
                 ).first()
             engine.dispose()
@@ -1003,6 +1274,8 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cycle_row[1], "reconciled")
         self.assertEqual(cycle_row[2], "turn_on")
         self.assertEqual(cycle_row[3], "live")
+        self.assertEqual(cycle_row[4], 1)
+        self.assertIsNone(cycle_row[5])
 
     async def test_weather_cache_reuses_daily_snapshot_within_process(self) -> None:
         weather_client = FakeCountingWeatherClient([_build_sunny_weather()])
@@ -1165,20 +1438,31 @@ def _test_settings(**overrides) -> Settings:
         "cerbo_port": 502,
         "cerbo_site_name": "Alaro",
         "cerbo_site_identifier": "cerbo-local",
+        "cerbo_fetch_retry_count": 2,
+        "cerbo_fetch_retry_delay_seconds": 0.0,
+        "cerbo_unavailable_grace_cycles": 3,
         "weather_latitude": 39.707337,
         "weather_longitude": 2.791675,
         "weather_timezone": "Europe/Madrid",
         "sunshine_hours_min": 6.5,
         "battery_min_soc_percent": 55.0,
+        "battery_soft_min_soc_percent": 35.0,
+        "battery_hard_min_soc_percent": 30.0,
+        "battery_capacity_kwh": 50.0,
         "auto_off_start_local": "00:00",
         "auto_resume_start_local": "00:00",
+        "day_morning_bias_end_local": "11:00",
         "auto_control_timezone": "UTC",
+        "forecast_liberal_sunshine_hours_min": 9.0,
+        "forecast_liberal_sunshine_hours_max": 12.0,
         "surplus_night_enabled": True,
         "surplus_night_base_load_kw": 1.5,
         "surplus_night_hard_min_soc_percent": 25.0,
         "surplus_night_buffer_soc_percent": 5.0,
         "surplus_night_turn_on_margin_soc_percent": 10.0,
         "surplus_night_turn_off_margin_soc_percent": 5.0,
+        "surplus_night_min_turn_on_margin_soc_percent": 7.0,
+        "surplus_night_min_turn_off_margin_soc_percent": 2.0,
         "surplus_night_next_day_sunshine_min": 9.0,
         "state_file": ".state/test-pump-policy-state.json",
         "database_url": "sqlite:///.state/test-automation.db",

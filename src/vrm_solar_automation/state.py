@@ -42,6 +42,9 @@ class StateStore:
                 is_on=bool(row.is_on),
                 changed_at_iso=row.changed_at_iso,
                 quiet_hours_forced_off=bool(row.quiet_hours_forced_off),
+                consecutive_power_failures=int(row.consecutive_power_failures or 0),
+                last_power_failure_at_iso=row.last_power_failure_at_iso,
+                last_power_failure_error=row.last_power_failure_error,
                 battery_alert_below_40_sent=bool(row.battery_alert_below_40_sent),
                 battery_alert_below_35_sent=bool(row.battery_alert_below_35_sent),
                 battery_alert_below_30_sent=bool(row.battery_alert_below_30_sent),
@@ -72,6 +75,9 @@ class StateStore:
                     is_on=state.is_on,
                     changed_at_iso=state.changed_at_iso,
                     quiet_hours_forced_off=state.quiet_hours_forced_off,
+                    consecutive_power_failures=state.consecutive_power_failures,
+                    last_power_failure_at_iso=state.last_power_failure_at_iso,
+                    last_power_failure_error=state.last_power_failure_error,
                     battery_alert_below_40_sent=state.battery_alert_below_40_sent,
                     battery_alert_below_35_sent=state.battery_alert_below_35_sent,
                     battery_alert_below_30_sent=state.battery_alert_below_30_sent,
@@ -97,6 +103,9 @@ class StateStore:
                 row.is_on = state.is_on
                 row.changed_at_iso = state.changed_at_iso
                 row.quiet_hours_forced_off = state.quiet_hours_forced_off
+                row.consecutive_power_failures = state.consecutive_power_failures
+                row.last_power_failure_at_iso = state.last_power_failure_at_iso
+                row.last_power_failure_error = state.last_power_failure_error
                 row.battery_alert_below_40_sent = state.battery_alert_below_40_sent
                 row.battery_alert_below_35_sent = state.battery_alert_below_35_sent
                 row.battery_alert_below_30_sent = state.battery_alert_below_30_sent
@@ -134,6 +143,7 @@ class StateStore:
         power: dict[str, object],
         weather: dict[str, object],
         weather_source: str,
+        power_status: dict[str, object],
         decision: PumpDecision,
         intended_target_is_on: bool,
         quiet_hours_blocked: bool,
@@ -168,12 +178,19 @@ class StateStore:
                     weather_code=_optional_int(weather.get("weather_code")),
                     queried_timezone=_optional_str(weather.get("queried_timezone")),
                     weather_source=weather_source,
+                    power_status_source=str(power_status.get("source") or "unknown"),
+                    power_status_available=bool(power_status.get("available")),
+                    power_status_error=_optional_str(power_status.get("error")),
                     should_turn_on=decision.should_turn_on,
                     decision_action=decision.action,
                     decision_reason=decision.reason,
                     decision_weather_mode=decision.weather_mode,
+                    soc_control_mode=decision.soc_control_mode,
                     night_required_soc_percent=decision.night_required_soc_percent,
                     night_surplus_mode_active=decision.night_surplus_mode_active,
+                    effective_turn_on_soc_percent=decision.effective_turn_on_soc_percent,
+                    effective_turn_off_soc_percent=decision.effective_turn_off_soc_percent,
+                    forecast_liberal_factor=decision.forecast_liberal_factor,
                     intended_target_is_on=intended_target_is_on,
                     quiet_hours_blocked=quiet_hours_blocked,
                     blocked_reason=blocked_reason,

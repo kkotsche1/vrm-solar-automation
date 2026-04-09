@@ -18,20 +18,31 @@ class Settings:
     cerbo_site_name: str = "Alaro (Cerbo GX)"
     cerbo_site_identifier: str = "cerbo-local"
     cerbo_mock_enabled: bool = False
+    cerbo_fetch_retry_count: int = 2
+    cerbo_fetch_retry_delay_seconds: float = 1.0
+    cerbo_unavailable_grace_cycles: int = 3
     weather_latitude: float = 39.707337
     weather_longitude: float = 2.791675
     weather_timezone: str = "Europe/Madrid"
     sunshine_hours_min: float = 6.5
     battery_min_soc_percent: float = 55.0
+    battery_soft_min_soc_percent: float = 35.0
+    battery_hard_min_soc_percent: float = 30.0
+    battery_capacity_kwh: float = 50.0
     auto_off_start_local: str = "18:00"
     auto_resume_start_local: str = "08:00"
+    day_morning_bias_end_local: str = "11:00"
     auto_control_timezone: str = "Europe/Madrid"
+    forecast_liberal_sunshine_hours_min: float = 9.0
+    forecast_liberal_sunshine_hours_max: float = 12.0
     surplus_night_enabled: bool = True
     surplus_night_base_load_kw: float = 1.5
     surplus_night_hard_min_soc_percent: float = 25.0
     surplus_night_buffer_soc_percent: float = 5.0
     surplus_night_turn_on_margin_soc_percent: float = 10.0
     surplus_night_turn_off_margin_soc_percent: float = 5.0
+    surplus_night_min_turn_on_margin_soc_percent: float = 7.0
+    surplus_night_min_turn_off_margin_soc_percent: float = 2.0
     surplus_night_next_day_sunshine_min: float = 9.0
     state_file: str = ".state/pump-policy-state.json"
     database_url: str = "sqlite:///.state/automation.db"
@@ -96,6 +107,18 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     auto_control_timezone = values.get("AUTO_CONTROL_TIMEZONE", weather_timezone)
     _validate_timezone(weather_timezone, key="WEATHER_TIMEZONE")
     _validate_timezone(auto_control_timezone, key="AUTO_CONTROL_TIMEZONE")
+    cerbo_fetch_retry_count = _parse_non_negative_int(
+        values.get("CERBO_FETCH_RETRY_COUNT", "2"),
+        key="CERBO_FETCH_RETRY_COUNT",
+    )
+    cerbo_fetch_retry_delay_seconds = _parse_non_negative_float(
+        values.get("CERBO_FETCH_RETRY_DELAY_SECONDS", "1.0"),
+        key="CERBO_FETCH_RETRY_DELAY_SECONDS",
+    )
+    cerbo_unavailable_grace_cycles = _parse_non_negative_int(
+        values.get("CERBO_UNAVAILABLE_GRACE_CYCLES", "3"),
+        key="CERBO_UNAVAILABLE_GRACE_CYCLES",
+    )
     sunshine_hours_min = _parse_hours(
         values.get("SUNSHINE_HOURS_MIN", "6.5"),
         key="SUNSHINE_HOURS_MIN",
@@ -103,6 +126,26 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     battery_min_soc_percent = _parse_percent(
         values.get("BATTERY_MIN_SOC_PERCENT", "55"),
         key="BATTERY_MIN_SOC_PERCENT",
+    )
+    battery_soft_min_soc_percent = _parse_percent(
+        values.get("BATTERY_SOFT_MIN_SOC_PERCENT", "35"),
+        key="BATTERY_SOFT_MIN_SOC_PERCENT",
+    )
+    battery_hard_min_soc_percent = _parse_percent(
+        values.get("BATTERY_HARD_MIN_SOC_PERCENT", "30"),
+        key="BATTERY_HARD_MIN_SOC_PERCENT",
+    )
+    battery_capacity_kwh = _parse_non_negative_float(
+        values.get("BATTERY_CAPACITY_KWH", "50"),
+        key="BATTERY_CAPACITY_KWH",
+    )
+    forecast_liberal_sunshine_hours_min = _parse_hours(
+        values.get("FORECAST_LIBERAL_SUNSHINE_HOURS_MIN", "9.0"),
+        key="FORECAST_LIBERAL_SUNSHINE_HOURS_MIN",
+    )
+    forecast_liberal_sunshine_hours_max = _parse_hours(
+        values.get("FORECAST_LIBERAL_SUNSHINE_HOURS_MAX", "12.0"),
+        key="FORECAST_LIBERAL_SUNSHINE_HOURS_MAX",
     )
     surplus_night_hard_min_soc_percent = _parse_percent(
         values.get("SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT", "25"),
@@ -120,6 +163,14 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         values.get("SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT", "5"),
         key="SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT",
     )
+    surplus_night_min_turn_on_margin_soc_percent = _parse_percent(
+        values.get("SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT", "7"),
+        key="SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT",
+    )
+    surplus_night_min_turn_off_margin_soc_percent = _parse_percent(
+        values.get("SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT", "2"),
+        key="SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT",
+    )
     surplus_night_next_day_sunshine_min = _parse_hours(
         values.get("SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN", "9.0"),
         key="SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN",
@@ -128,6 +179,34 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         values.get("SURPLUS_NIGHT_BASE_LOAD_KW", "1.5"),
         key="SURPLUS_NIGHT_BASE_LOAD_KW",
     )
+    if battery_hard_min_soc_percent > battery_soft_min_soc_percent:
+        raise ValueError(
+            "BATTERY_HARD_MIN_SOC_PERCENT must be less than or equal to "
+            "BATTERY_SOFT_MIN_SOC_PERCENT."
+        )
+    if battery_soft_min_soc_percent > battery_min_soc_percent:
+        raise ValueError(
+            "BATTERY_SOFT_MIN_SOC_PERCENT must be less than or equal to "
+            "BATTERY_MIN_SOC_PERCENT."
+        )
+    if forecast_liberal_sunshine_hours_max < forecast_liberal_sunshine_hours_min:
+        raise ValueError(
+            "FORECAST_LIBERAL_SUNSHINE_HOURS_MAX must be greater than or equal to "
+            "FORECAST_LIBERAL_SUNSHINE_HOURS_MIN."
+        )
+    if surplus_night_min_turn_on_margin_soc_percent > surplus_night_turn_on_margin_soc_percent:
+        raise ValueError(
+            "SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT must be less than or equal to "
+            "SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT."
+        )
+    if (
+        surplus_night_min_turn_off_margin_soc_percent
+        > surplus_night_turn_off_margin_soc_percent
+    ):
+        raise ValueError(
+            "SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT must be less than or equal to "
+            "SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT."
+        )
 
     return Settings(
         email=values.get("VICTRON_EMAIL"),
@@ -143,11 +222,17 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             "yes",
             "on",
         },
+        cerbo_fetch_retry_count=cerbo_fetch_retry_count,
+        cerbo_fetch_retry_delay_seconds=cerbo_fetch_retry_delay_seconds,
+        cerbo_unavailable_grace_cycles=cerbo_unavailable_grace_cycles,
         weather_latitude=float(values.get("WEATHER_LATITUDE", "39.707337")),
         weather_longitude=float(values.get("WEATHER_LONGITUDE", "2.791675")),
         weather_timezone=weather_timezone,
         sunshine_hours_min=sunshine_hours_min,
         battery_min_soc_percent=battery_min_soc_percent,
+        battery_soft_min_soc_percent=battery_soft_min_soc_percent,
+        battery_hard_min_soc_percent=battery_hard_min_soc_percent,
+        battery_capacity_kwh=battery_capacity_kwh,
         auto_off_start_local=_parse_local_hhmm(
             values.get("AUTO_OFF_START_LOCAL", "18:00"),
             key="AUTO_OFF_START_LOCAL",
@@ -156,7 +241,13 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             values.get("AUTO_RESUME_START_LOCAL", "08:00"),
             key="AUTO_RESUME_START_LOCAL",
         ),
+        day_morning_bias_end_local=_parse_local_hhmm(
+            values.get("DAY_MORNING_BIAS_END_LOCAL", "11:00"),
+            key="DAY_MORNING_BIAS_END_LOCAL",
+        ),
         auto_control_timezone=auto_control_timezone,
+        forecast_liberal_sunshine_hours_min=forecast_liberal_sunshine_hours_min,
+        forecast_liberal_sunshine_hours_max=forecast_liberal_sunshine_hours_max,
         surplus_night_enabled=values.get("SURPLUS_NIGHT_ENABLED", "true").lower() in {
             "1",
             "true",
@@ -168,6 +259,12 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         surplus_night_buffer_soc_percent=surplus_night_buffer_soc_percent,
         surplus_night_turn_on_margin_soc_percent=surplus_night_turn_on_margin_soc_percent,
         surplus_night_turn_off_margin_soc_percent=surplus_night_turn_off_margin_soc_percent,
+        surplus_night_min_turn_on_margin_soc_percent=(
+            surplus_night_min_turn_on_margin_soc_percent
+        ),
+        surplus_night_min_turn_off_margin_soc_percent=(
+            surplus_night_min_turn_off_margin_soc_percent
+        ),
         surplus_night_next_day_sunshine_min=surplus_night_next_day_sunshine_min,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),
         database_url=values.get("DATABASE_URL", "sqlite:///.state/automation.db"),
@@ -245,6 +342,16 @@ def _parse_non_negative_float(value: str, *, key: str) -> float:
         candidate = float(value)
     except ValueError as exc:
         raise ValueError(f"{key} must be a numeric value.") from exc
+    if candidate < 0:
+        raise ValueError(f"{key} must be greater than or equal to zero.")
+    return candidate
+
+
+def _parse_non_negative_int(value: str, *, key: str) -> int:
+    try:
+        candidate = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer value.") from exc
     if candidate < 0:
         raise ValueError(f"{key} must be greater than or equal to zero.")
     return candidate

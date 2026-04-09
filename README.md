@@ -20,6 +20,8 @@ Email notifications are sent for:
 - generator power being detected at `100 W` or higher
 - weather-based forecast blocks that keep automation `OFF` (sent at most once per weather-local day)
 
+Notification emails are formatted for human readability: concise subjects, plain-language labels (no internal action tags), and bullet-list bodies with local date/time (`YYYY-MM-DD HH:MM`).
+
 Battery and generator alerts are latched in the database, so a one-shot scheduler only sends one alert per active condition. The latch resets automatically after battery SOC recovers above the threshold or generator power disappears. Weather-block alerts are date-latched and send once per `WEATHER_TIMEZONE` day.
 
 Manual override is no longer stored in the backend. If the plug is changed in the Shelly app, the automation waits for a fresh automatic transition before reasserting the plug state:
@@ -52,20 +54,31 @@ CERBO_PORT=502
 CERBO_SITE_NAME=Alaro (Cerbo GX)
 CERBO_SITE_IDENTIFIER=cerbo-local
 CERBO_MOCK_ENABLED=false
+CERBO_FETCH_RETRY_COUNT=2
+CERBO_FETCH_RETRY_DELAY_SECONDS=1.0
+CERBO_UNAVAILABLE_GRACE_CYCLES=3
 WEATHER_LATITUDE=39.707337
 WEATHER_LONGITUDE=2.791675
 WEATHER_TIMEZONE=Europe/Madrid
 SUNSHINE_HOURS_MIN=6.5
 BATTERY_MIN_SOC_PERCENT=55
+BATTERY_SOFT_MIN_SOC_PERCENT=35
+BATTERY_HARD_MIN_SOC_PERCENT=30
+BATTERY_CAPACITY_KWH=50
 AUTO_OFF_START_LOCAL=18:00
 AUTO_RESUME_START_LOCAL=08:00
+DAY_MORNING_BIAS_END_LOCAL=11:00
 AUTO_CONTROL_TIMEZONE=Europe/Madrid
+FORECAST_LIBERAL_SUNSHINE_HOURS_MIN=9.0
+FORECAST_LIBERAL_SUNSHINE_HOURS_MAX=12.0
 SURPLUS_NIGHT_ENABLED=true
 SURPLUS_NIGHT_BASE_LOAD_KW=1.5
 SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT=25
 SURPLUS_NIGHT_BUFFER_SOC_PERCENT=5
 SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=10
 SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT=5
+SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT=7
+SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT=2
 SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN=9.0
 DATABASE_URL=sqlite:///.state/automation.db
 DATABASE_AUTO_MIGRATE=false
@@ -81,9 +94,24 @@ SMTP_GMAIL_APP_PASSWORD=your-gmail-app-password
 SMTP_GMAIL_RECIPIENTS=f.kotschenreuther@yahoo.de,monika_kotschenreuther@yahoo.de,kkotsche1@gmail.com
 ```
 
+Cerbo reads are now hardened against transient Modbus/TCP dropouts:
+
+- `CERBO_FETCH_RETRY_COUNT` controls the number of retry attempts after the initial Cerbo read fails.
+- `CERBO_FETCH_RETRY_DELAY_SECONDS` controls the fixed delay between retry attempts.
+- `CERBO_UNAVAILABLE_GRACE_CYCLES` controls how many consecutive failed control cycles may preserve an already-running automatic `ON` target before the controller fails safe to `OFF`.
+
+Grace applies only to preserving an already-running automatic target. The controller never turns the pump on without a fresh successful Cerbo read.
+
 `SUNSHINE_HOURS_MIN` configures the minimum daily direct-sunshine forecast required for automatic daytime demand. The controller requests `sunshine_duration` from Open-Meteo, converts it to hours, and only allows automatic demand when the forecast meets or exceeds this threshold. The initial production default for this installation is `6.5`.
 
-`BATTERY_MIN_SOC_PERCENT` configures the single battery cutoff. It must be a numeric percentage between `0` and `100`. Automatic demand may run only when battery SOC is strictly above this value; at or below it, the pump stays off. The recommended starting value for this installation is `55`.
+The daytime SOC settings are now forecast-adaptive instead of using a single fixed cutoff:
+
+- `BATTERY_MIN_SOC_PERCENT` is the conservative cloudy-day daytime threshold.
+- `BATTERY_SOFT_MIN_SOC_PERCENT` is the preferred sunny-day daytime floor.
+- `BATTERY_HARD_MIN_SOC_PERCENT` is the non-negotiable automatic cutoff.
+- `FORECAST_LIBERAL_SUNSHINE_HOURS_MIN` and `FORECAST_LIBERAL_SUNSHINE_HOURS_MAX` define how quickly the controller interpolates from the conservative threshold toward the softer sunny-day thresholds.
+- `DAY_MORNING_BIAS_END_LOCAL` keeps the post-resume keep-running threshold more permissive for a short morning window so the controller does not repeat the April 8, 2026 `08:30` handoff problem where strong-sun surplus-night runtime was immediately overridden by a stricter daytime cutoff.
+- `BATTERY_CAPACITY_KWH` is used by reserve-aware night mode to convert base-load energy into an SOC reserve.
 
 `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` define the overnight control window in `AUTO_CONTROL_TIMEZONE`. With `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware overnight automation instead of a hard forced-`OFF` quiet-hours block.
 Seasonal `SUMMER_*` / `WINTER_*` quiet-hours keys are not supported.
@@ -93,8 +121,11 @@ The surplus-night settings keep the logic simple and deterministic:
 - `SURPLUS_NIGHT_BASE_LOAD_KW` is the fixed overnight house base load used to reserve battery energy.
 - `SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT` is the hard battery floor.
 - `SURPLUS_NIGHT_BUFFER_SOC_PERCENT` adds a small extra reserve above the hard floor.
-- `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT` and `SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT` provide the night hysteresis.
+- `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT` and `SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT` are the conservative night hysteresis margins.
+- `SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT` and `SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT` are the softened margins used on the strongest solar forecasts.
 - `SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN` is the required sunshine-hours forecast for the next daylight period before night runtime is allowed.
+
+The current site assumptions behind the reserve math are a `50 kWh` battery and a fixed `1.5 kW` overnight base load. The `4.5 kW` heat-pump draw and `15 kW` solar peak remain operational context for tuning, but they are not direct first-pass policy inputs yet.
 
 `DATABASE_URL` points to the SQLAlchemy database connection used for runtime state and historical tracking. `DATABASE_AUTO_MIGRATE=true` can be enabled to run Alembic migrations automatically when the controller starts. For Raspberry Pi timer deployments, enable it or run `python -m vrm_solar_automation db-upgrade` before restarting the timer whenever the schema changes.
 
@@ -242,21 +273,28 @@ python scripts/pump_control_loop.py --env-file .env --interval-seconds 15
 
 The controller follows a small deterministic flow:
 
-1. Fail safe to `OFF` when battery SOC is unavailable.
-2. Force `OFF` when generator power is `100 W` or more.
-3. Use the daily Open-Meteo sunshine forecast to determine daytime demand:
+1. Fetch Cerbo telemetry with in-run retries (`CERBO_FETCH_RETRY_COUNT`, `CERBO_FETCH_RETRY_DELAY_SECONDS`).
+2. If Cerbo telemetry is still unavailable after retries:
+   - preserve an already-running automatic `ON` target through up to `CERBO_UNAVAILABLE_GRACE_CYCLES - 1` consecutive failed cycles
+   - fail safe to `OFF` on the cycle that reaches `CERBO_UNAVAILABLE_GRACE_CYCLES`
+   - never turn the pump `ON` without a fresh successful Cerbo read
+3. Force `OFF` when generator power is `100 W` or more.
+4. Use the daily Open-Meteo sunshine forecast to determine daytime demand:
    - `sufficient_sun` when `today_sunshine_hours >= SUNSHINE_HOURS_MIN`
    - `insufficient_sun` when `today_sunshine_hours < SUNSHINE_HOURS_MIN`
    - `unknown` when sunshine hours are unavailable
    - when a live weather refresh fails, the one-shot controller reuses the last successful forecast for the same local weather day before falling back to `unknown`
-4. If demand exists, use the configured battery cutoff from `.env`:
-   - turn `OFF` at or below `BATTERY_MIN_SOC_PERCENT`
-   - allow `ON` only when SOC is strictly above `BATTERY_MIN_SOC_PERCENT`
-5. During the overnight window (`AUTO_OFF_START_LOCAL` to `AUTO_RESUME_START_LOCAL`):
+5. If daytime demand exists, use forecast-adaptive SOC hysteresis:
+   - always turn `OFF` at or below `BATTERY_HARD_MIN_SOC_PERCENT`
+   - compute a forecast liberalization factor from `FORECAST_LIBERAL_SUNSHINE_HOURS_MIN` to `FORECAST_LIBERAL_SUNSHINE_HOURS_MAX`
+   - use that factor to interpolate between `BATTERY_MIN_SOC_PERCENT` and the sunny-day thresholds derived from `BATTERY_SOFT_MIN_SOC_PERCENT`
+   - during `AUTO_RESUME_START_LOCAL` through `DAY_MORNING_BIAS_END_LOCAL`, a previously running pump gets an extra keep-running reduction, but never below `BATTERY_HARD_MIN_SOC_PERCENT`
+6. During the overnight window (`AUTO_OFF_START_LOCAL` to `AUTO_RESUME_START_LOCAL`):
    - if `SURPLUS_NIGHT_ENABLED=false`, the pump target is forced `OFF`
    - if `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware night mode
    - after the nightly start time, the night rule uses tomorrow's sunshine forecast; after midnight it uses today's sunshine forecast
-   - the pump turns `ON` only when SOC stays above the hard floor plus safety buffer plus reserved overnight base-load energy, with separate turn-on and turn-off margins for hysteresis
+   - the pump turns `ON` only when SOC stays above the hard floor plus safety buffer plus reserved overnight base-load energy
+   - the night turn-on and keep-running margins are softened on stronger solar forecasts, but the keep-running threshold never drops below `BATTERY_HARD_MIN_SOC_PERCENT`
 
 ## State handling
 
@@ -268,8 +306,10 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 `control_cycle` rows include:
 
 - Cerbo GX metrics (battery, solar, house, generator, active source, phase values)
+- Cerbo telemetry status fields (`power_status_source`, `power_status_available`, `power_status_error`)
 - weather snapshot used for policy evaluation, including `today_sunshine_hours`, `tomorrow_sunshine_hours`, plus `weather_source` (`live`, `same_day_cache`, or `unavailable`)
-- policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`)
+- policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`, `soc_control_mode`)
+- adaptive SOC diagnostics (`effective_turn_on_soc_percent`, `effective_turn_off_soc_percent`, `forecast_liberal_factor`)
 - reserve-aware night diagnostics (`night_required_soc_percent`, `night_surplus_mode_active`) when the overnight rule is active
 - intended target and quiet-hours block metadata
 - Shelly actuation result (`status`, command, observed before/after, error)
@@ -277,6 +317,8 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 The runtime state still lets one-shot scheduling tolerate manual Shelly changes without introducing a separate override system. It also persists whether the previous cycle was quiet-hours-forced so a one-shot scheduler can turn the plug back on correctly when the quiet-hours window ends.
 
 The same singleton runtime row also stores the alert latches for the `40%`, `35%`, and `30%` battery warnings plus the generator-running warning and the weather-block daily notification date.
+
+The same singleton runtime row also stores the Cerbo telemetry failure streak plus the last Cerbo failure timestamp and error text. That is what lets the controller distinguish between a one-off transient read failure and a sustained outage before forcing the pump off.
 
 The same singleton runtime row also caches the last successful weather snapshot for the local weather day. That cache is what prevents transient Open-Meteo failures from causing a same-minute `OFF` followed by `ON` when the next scheduled run succeeds again.
 
