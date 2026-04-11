@@ -287,6 +287,7 @@ The controller follows a small deterministic flow:
 5. If daytime demand exists, use forecast-adaptive SOC hysteresis:
    - always turn `OFF` at or below `BATTERY_HARD_MIN_SOC_PERCENT`
    - compute a forecast liberalization factor from `FORECAST_LIBERAL_SUNSHINE_HOURS_MIN` to `FORECAST_LIBERAL_SUNSHINE_HOURS_MAX`
+   - keep the daytime demand gate based on `today_sunshine_hours`, but use the weaker of `today_sunshine_hours` and `tomorrow_sunshine_hours` to decide how conservative daytime SOC thresholds should be
    - use that factor to interpolate between `BATTERY_MIN_SOC_PERCENT` and the sunny-day thresholds derived from `BATTERY_SOFT_MIN_SOC_PERCENT`
    - during `AUTO_RESUME_START_LOCAL` through `DAY_MORNING_BIAS_END_LOCAL`, a previously running pump gets an extra keep-running reduction, but never below `BATTERY_HARD_MIN_SOC_PERCENT`
 6. During the overnight window (`AUTO_OFF_START_LOCAL` to `AUTO_RESUME_START_LOCAL`):

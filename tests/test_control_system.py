@@ -317,7 +317,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=40.0)
             ),
-            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.5)),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=10.5)
+            ),
             state_store=state_store,
             now_provider=_fixed_now(2026, 1, 10, 8, 31),
         )
@@ -340,7 +342,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=43.0)
             ),
-            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.5)),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=10.5)
+            ),
             state_store=FakeStateStore(),
             now_provider=_fixed_now(2026, 1, 10, 8, 45),
         )
@@ -394,7 +398,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=39.0)
             ),
-            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.5)),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=10.5)
+            ),
             state_store=state_store,
             now_provider=_fixed_now(2026, 1, 10, 11, 1),
         )
@@ -416,7 +422,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             probe_client=FakeProbeClient(
                 _build_power_snapshot(generator_watts=0.0, battery_soc_percent=30.0)
             ),
-            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=12.0)),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=12.0, tomorrow_sunshine_hours=12.0)
+            ),
             state_store=FakeStateStore(),
             now_provider=_fixed_now(2026, 1, 10, 9, 0),
         )
@@ -425,6 +433,56 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(decision.should_turn_on)
         self.assertIn("30.0% hard automatic cutoff", decision.reason)
+
+    async def test_daytime_uses_weaker_tomorrow_forecast_for_soc_thresholds(self) -> None:
+        system = PumpControlSystem(
+            _test_settings(
+                battery_min_soc_percent=45.0,
+                auto_resume_start_local="08:30",
+                day_morning_bias_end_local="11:00",
+                auto_control_timezone="UTC",
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=43.0)
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=9.0)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 10, 8, 45),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertAlmostEqual(float(payload["effective_turn_on_soc_percent"]), 45.0, places=1)
+        self.assertAlmostEqual(float(payload["forecast_liberal_factor"]), 0.0, places=2)
+        self.assertIn("tomorrow's weaker 9.0-hour sunshine forecast", decision.reason)
+
+    async def test_daytime_falls_back_to_today_when_tomorrow_forecast_is_missing(self) -> None:
+        system = PumpControlSystem(
+            _test_settings(
+                battery_min_soc_percent=45.0,
+                auto_resume_start_local="08:30",
+                day_morning_bias_end_local="11:00",
+                auto_control_timezone="UTC",
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=43.0)
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=None)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 10, 8, 45),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertAlmostEqual(float(payload["effective_turn_on_soc_percent"]), 42.5, places=1)
+        self.assertAlmostEqual(float(payload["forecast_liberal_factor"]), 0.5, places=2)
+        self.assertNotIn("tomorrow's weaker", decision.reason)
 
     async def test_control_uses_configured_sunshine_threshold(self) -> None:
         system = PumpControlSystem(

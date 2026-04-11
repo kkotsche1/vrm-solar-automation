@@ -147,9 +147,11 @@ class PumpPolicy:
         battery_soc = power.battery_soc_percent
         generator_watts = abs(power.generator_watts or 0.0)
         sunshine_hours = weather.today_sunshine_hours
+        daytime_soc_sunshine_hours = self._daytime_soc_sunshine_hours(weather)
+        tomorrow_reserve_suffix = self._daytime_soc_reason_suffix(weather=weather)
         previous_target_is_on = previous_state.is_on if previous_state is not None else False
         liberal_factor = forecast_liberal_factor(
-            sunshine_hours,
+            daytime_soc_sunshine_hours,
             liberal_sunshine_hours_min=self._config.forecast_liberal_sunshine_hours_min,
             liberal_sunshine_hours_max=self._config.forecast_liberal_sunshine_hours_max,
         )
@@ -160,10 +162,10 @@ class PumpPolicy:
             ),
         )
         effective_turn_on_soc_percent = (
-            thresholds.turn_on_soc if sunshine_hours is not None else None
+            thresholds.turn_on_soc if daytime_soc_sunshine_hours is not None else None
         )
         effective_turn_off_soc_percent = (
-            thresholds.turn_off_soc if sunshine_hours is not None else None
+            thresholds.turn_off_soc if daytime_soc_sunshine_hours is not None else None
         )
 
         if battery_soc is None:
@@ -243,7 +245,7 @@ class PumpPolicy:
                     reason=(
                         f"Today's sunshine forecast is {sunshine_hours:.1f} hours, but adaptive daytime control "
                         f"needs at least {thresholds.turn_off_soc:.1f}% SOC to keep running and battery SOC is "
-                        f"{battery_soc:.1f}%, so the pump turns off."
+                        f"{battery_soc:.1f}%, so the pump turns off{tomorrow_reserve_suffix}."
                     ),
                 )
             return self._decision(
@@ -256,7 +258,8 @@ class PumpPolicy:
                 reason=(
                     f"Today's sunshine forecast is {sunshine_hours:.1f} hours, meeting the "
                     f"{self._config.sunshine_hours_min:.1f}-hour minimum, and battery SOC is {battery_soc:.1f}%, "
-                    f"above the adaptive {thresholds.turn_off_soc:.1f}% keep-running threshold."
+                    f"above the adaptive {thresholds.turn_off_soc:.1f}% keep-running threshold"
+                    f"{tomorrow_reserve_suffix}."
                 ),
             )
 
@@ -271,7 +274,7 @@ class PumpPolicy:
                 reason=(
                     f"Today's sunshine forecast is {sunshine_hours:.1f} hours, but adaptive daytime control "
                     f"needs at least {thresholds.turn_on_soc:.1f}% SOC to turn on and battery SOC is "
-                    f"{battery_soc:.1f}%, so the pump stays off."
+                    f"{battery_soc:.1f}%, so the pump stays off{tomorrow_reserve_suffix}."
                 ),
             )
 
@@ -285,7 +288,8 @@ class PumpPolicy:
             reason=(
                 f"Today's sunshine forecast is {sunshine_hours:.1f} hours, meeting the "
                 f"{self._config.sunshine_hours_min:.1f}-hour minimum, and battery SOC is {battery_soc:.1f}%, "
-                f"meeting the adaptive {thresholds.turn_on_soc:.1f}% turn-on threshold."
+                f"meeting the adaptive {thresholds.turn_on_soc:.1f}% turn-on threshold"
+                f"{tomorrow_reserve_suffix}."
             ),
         )
 
@@ -296,6 +300,29 @@ class PumpPolicy:
         if sunshine_hours < self._config.sunshine_hours_min:
             return "insufficient_sun"
         return "sufficient_sun"
+
+    @staticmethod
+    def _daytime_soc_sunshine_hours(weather: WeatherSnapshot) -> float | None:
+        if weather.today_sunshine_hours is None:
+            return None
+        if weather.tomorrow_sunshine_hours is None:
+            return weather.today_sunshine_hours
+        return min(weather.today_sunshine_hours, weather.tomorrow_sunshine_hours)
+
+    @staticmethod
+    def _daytime_soc_reason_suffix(*, weather: WeatherSnapshot) -> str:
+        today_sunshine_hours = weather.today_sunshine_hours
+        tomorrow_sunshine_hours = weather.tomorrow_sunshine_hours
+        if (
+            today_sunshine_hours is None
+            or tomorrow_sunshine_hours is None
+            or tomorrow_sunshine_hours >= today_sunshine_hours
+        ):
+            return ""
+        return (
+            f" because tomorrow's weaker {tomorrow_sunshine_hours:.1f}-hour sunshine forecast "
+            "keeps daytime SOC thresholds conservative"
+        )
 
     def _decision(
         self,
