@@ -248,6 +248,13 @@ class PumpControlSystem:
             decision_action=decision.action,
             decision_reason=decision.reason,
         )
+        final_state = self._apply_plug_mismatch_alert_state(
+            final_state,
+            actuation=actuation,
+            intended_is_on=intended_is_on,
+            decision_action=decision.action,
+            decision_reason=decision.reason,
+        )
         final_state = self._apply_alert_state(
             final_state,
             power=power,
@@ -590,8 +597,10 @@ class PumpControlSystem:
         except ShellyError as exc:
             error = str(exc)
 
+        observed_mismatch = observed_before is not None and observed_before != intended_is_on
         should_force_reconcile = quiet_hours_active and observed_before is True and not intended_is_on
-        should_reconcile = target_changed or should_force_reconcile
+        # Reassert the automatic target as soon as the plug is reachable again and visibly drifted.
+        should_reconcile = target_changed or should_force_reconcile or observed_mismatch
 
         if not should_reconcile:
             status = "unreachable" if error is not None and observed_before is None else "no_target_change"
@@ -654,7 +663,11 @@ class PumpControlSystem:
             error=error,
         )
 
-        if command_sent is not None and self._notifier is not None:
+        if (
+            command_sent is not None
+            and decision_action not in ("keep_on", "keep_off")
+            and self._notifier is not None
+        ):
             try:
                 self._notifier.send_plug_state_change_email(
                     command_sent=command_sent,
@@ -699,6 +712,60 @@ class PumpControlSystem:
             last_actuation_error=error,
             last_actuation_at_iso=(now_iso if mark_actuation else state.last_actuation_at_iso),
         )
+
+    def _apply_plug_mismatch_alert_state(
+        self,
+        state: PumpPolicyState,
+        *,
+        actuation: PumpActuationResult,
+        intended_is_on: bool,
+        decision_action: str,
+        decision_reason: str,
+    ) -> PumpPolicyState:
+        observed_is_on = actuation.observed_after_is_on
+        mismatch_alert_sent = state.plug_mismatch_alert_sent
+
+        if observed_is_on is not None and observed_is_on != intended_is_on:
+            if not mismatch_alert_sent:
+                mismatch_alert_sent = self._send_plug_state_mismatch_alert(
+                    intended_is_on=intended_is_on,
+                    observed_is_on=observed_is_on,
+                    decision_action=decision_action,
+                    decision_reason=decision_reason,
+                    actuation_status=actuation.status,
+                )
+        elif observed_is_on is not None:
+            mismatch_alert_sent = False
+
+        return replace(
+            state,
+            plug_mismatch_alert_sent=mismatch_alert_sent,
+        )
+
+    def _send_plug_state_mismatch_alert(
+        self,
+        *,
+        intended_is_on: bool,
+        observed_is_on: bool,
+        decision_action: str,
+        decision_reason: str,
+        actuation_status: str,
+    ) -> bool:
+        if self._notifier is None:
+            return False
+        try:
+            self._notifier.send_plug_state_mismatch_email(
+                at_iso=datetime.now(UTC).isoformat(),
+                intended_is_on=intended_is_on,
+                observed_is_on=observed_is_on,
+                decision_action=decision_action,
+                decision_reason=decision_reason,
+                actuation_status=actuation_status,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            LOGGER.warning("Failed to send plug-state mismatch email: %s", exc)
+            return False
+        return True
 
     def _apply_alert_state(
         self,

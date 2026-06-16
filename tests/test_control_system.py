@@ -77,9 +77,17 @@ class FakeUnavailableProbeClient:
 
 
 class FakePlugClient:
-    def __init__(self, status_outputs: list[bool] | None = None) -> None:
+    def __init__(
+        self,
+        status_outputs: list[bool] | None = None,
+        *,
+        turn_on_output: bool = True,
+        turn_off_output: bool = False,
+    ) -> None:
         raw_outputs = status_outputs or [False, True]
         self._status_reads = [_build_switch_status(output) for output in raw_outputs]
+        self._turn_on_output = turn_on_output
+        self._turn_off_output = turn_off_output
         self.turn_on_calls = 0
         self.turn_off_calls = 0
 
@@ -94,7 +102,7 @@ class FakePlugClient:
             switch_id=0,
             requested_on=True,
             was_on=False,
-            output=True,
+            output=self._turn_on_output,
             source="HTTP_in",
             toggle_after_seconds=None,
             executed_at_iso=datetime.now(UTC).isoformat(),
@@ -106,7 +114,7 @@ class FakePlugClient:
             switch_id=0,
             requested_on=False,
             was_on=True,
-            output=False,
+            output=self._turn_off_output,
             source="HTTP_in",
             toggle_after_seconds=None,
             executed_at_iso=datetime.now(UTC).isoformat(),
@@ -132,6 +140,7 @@ class FakeNotifier:
     def __init__(self, *, should_raise: bool = False) -> None:
         self.should_raise = should_raise
         self.calls: list[dict[str, object]] = []
+        self.mismatch_alert_calls: list[dict[str, object]] = []
         self.battery_alert_calls: list[dict[str, object]] = []
         self.generator_alert_calls: list[dict[str, object]] = []
         self.weather_block_alert_calls: list[dict[str, object]] = []
@@ -158,6 +167,29 @@ class FakeNotifier:
                 "observed_before_is_on": observed_before_is_on,
                 "observed_after_is_on": observed_after_is_on,
                 "at_iso": at_iso,
+            }
+        )
+        if self.should_raise:
+            raise RuntimeError("smtp failed")
+
+    def send_plug_state_mismatch_email(
+        self,
+        *,
+        at_iso: str,
+        intended_is_on: bool,
+        observed_is_on: bool,
+        decision_action: str,
+        decision_reason: str,
+        actuation_status: str,
+    ) -> None:
+        self.mismatch_alert_calls.append(
+            {
+                "at_iso": at_iso,
+                "intended_is_on": intended_is_on,
+                "observed_is_on": observed_is_on,
+                "decision_action": decision_action,
+                "decision_reason": decision_reason,
+                "actuation_status": actuation_status,
             }
         )
         if self.should_raise:
@@ -1015,7 +1047,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertIn("Generator power is present", decision.reason)
 
-    async def test_no_target_change_does_not_send_email(self) -> None:
+    async def test_reachable_mismatch_is_reconciled_even_without_target_change(self) -> None:
         notifier = FakeNotifier()
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
@@ -1024,20 +1056,24 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             last_known_plug_is_on=False,
             last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
         )
+        plug_client = FakePlugClient(status_outputs=[False, True])
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
             weather_client=FakeWeatherClient(_build_sunny_weather()),
-            plug_client=FakePlugClient(status_outputs=[False, False]),
+            plug_client=plug_client,
             state_store=state_store,
             notifier=notifier,
         )
 
         _, payload = await system.control()
 
-        self.assertEqual(payload["actuation"]["status"], "no_target_change")
-        self.assertIsNone(payload["actuation"]["command_sent"])
-        self.assertEqual(notifier.calls, [])
+        self.assertEqual(payload["actuation"]["status"], "reconciled")
+        self.assertEqual(payload["actuation"]["command_sent"], "turn_on")
+        self.assertEqual(plug_client.turn_on_calls, 1)
+        self.assertEqual(len(notifier.calls), 0)
+        self.assertEqual(notifier.mismatch_alert_calls, [])
+        self.assertFalse(state_store.state.plug_mismatch_alert_sent)
 
     async def test_email_failure_is_non_blocking(self) -> None:
         notifier = FakeNotifier(should_raise=True)
@@ -1057,6 +1093,48 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["actuation"]["command_sent"], "turn_on")
         self.assertIsNone(payload["actuation"]["error"])
         self.assertEqual(len(notifier.calls), 1)
+
+    async def test_mismatch_alert_latch_resets_after_alignment(self) -> None:
+        notifier = FakeNotifier()
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+            last_known_plug_is_on=False,
+            last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        plug_client = FakePlugClient(
+            status_outputs=[False, False, False, False, True, False, False],
+            turn_on_output=False,
+        )
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                [
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
+                ]
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            plug_client=plug_client,
+            state_store=state_store,
+            notifier=notifier,
+        )
+
+        _, first_payload = await system.control()
+        _, second_payload = await system.control()
+        _, third_payload = await system.control()
+        _, fourth_payload = await system.control()
+
+        self.assertEqual(first_payload["actuation"]["status"], "mismatch_after_command")
+        self.assertEqual(second_payload["actuation"]["status"], "mismatch_after_command")
+        self.assertEqual(third_payload["actuation"]["status"], "no_target_change")
+        self.assertEqual(fourth_payload["actuation"]["status"], "mismatch_after_command")
+        self.assertEqual(plug_client.turn_on_calls, 3)
+        self.assertEqual(len(notifier.mismatch_alert_calls), 2)
+        self.assertTrue(state_store.state.plug_mismatch_alert_sent)
 
     async def test_generator_alert_is_sent_once_per_running_period(self) -> None:
         notifier = FakeNotifier()
@@ -1226,7 +1304,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(generator_decision.should_turn_on)
         self.assertEqual(len(notifier.weather_block_alert_calls), 0)
 
-    async def test_manual_shelly_off_during_automatic_on_waits_for_next_off_then_on(self) -> None:
+    async def test_manual_shelly_off_during_automatic_on_reasserts_immediately(self) -> None:
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
             is_on=True,
@@ -1234,35 +1312,25 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             last_known_plug_is_on=True,
             last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
         )
-        plug_client = FakePlugClient(status_outputs=[False, False, False, False, True])
+        plug_client = FakePlugClient(status_outputs=[False, True])
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(
-                [
-                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
-                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=45.0),
-                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
-                ]
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0)
             ),
             weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=plug_client,
             state_store=state_store,
         )
 
-        _, first_payload = await system.control()
-        _, second_payload = await system.control()
-        _, third_payload = await system.control()
+        _, payload = await system.control()
 
-        self.assertEqual(first_payload["actuation"]["status"], "no_target_change")
-        self.assertIsNone(first_payload["actuation"]["command_sent"])
-        self.assertEqual(second_payload["actuation"]["status"], "already_aligned")
-        self.assertIsNone(second_payload["actuation"]["command_sent"])
-        self.assertEqual(third_payload["actuation"]["status"], "reconciled")
-        self.assertEqual(third_payload["actuation"]["command_sent"], "turn_on")
+        self.assertEqual(payload["actuation"]["status"], "reconciled")
+        self.assertEqual(payload["actuation"]["command_sent"], "turn_on")
         self.assertEqual(plug_client.turn_on_calls, 1)
         self.assertEqual(plug_client.turn_off_calls, 0)
 
-    async def test_manual_shelly_on_during_automatic_off_waits_for_next_on_then_off(self) -> None:
+    async def test_manual_shelly_on_during_automatic_off_reasserts_immediately(self) -> None:
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
             is_on=False,
@@ -1270,31 +1338,21 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             last_known_plug_is_on=False,
             last_known_plug_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
         )
-        plug_client = FakePlugClient(status_outputs=[True, True, True, True, False])
+        plug_client = FakePlugClient(status_outputs=[True, False])
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(
-                [
-                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=45.0),
-                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=82.0),
-                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=45.0),
-                ]
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=45.0)
             ),
             weather_client=FakeWeatherClient(_build_sunny_weather()),
             plug_client=plug_client,
             state_store=state_store,
         )
 
-        _, first_payload = await system.control()
-        _, second_payload = await system.control()
-        _, third_payload = await system.control()
+        _, payload = await system.control()
 
-        self.assertEqual(first_payload["actuation"]["status"], "no_target_change")
-        self.assertIsNone(first_payload["actuation"]["command_sent"])
-        self.assertEqual(second_payload["actuation"]["status"], "already_aligned")
-        self.assertIsNone(second_payload["actuation"]["command_sent"])
-        self.assertEqual(third_payload["actuation"]["status"], "reconciled")
-        self.assertEqual(third_payload["actuation"]["command_sent"], "turn_off")
+        self.assertEqual(payload["actuation"]["status"], "reconciled")
+        self.assertEqual(payload["actuation"]["command_sent"], "turn_off")
         self.assertEqual(plug_client.turn_on_calls, 0)
         self.assertEqual(plug_client.turn_off_calls, 1)
 

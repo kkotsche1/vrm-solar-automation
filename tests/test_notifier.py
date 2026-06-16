@@ -90,6 +90,32 @@ class GmailSmtpNotifierTests(unittest.TestCase):
         self.assertIn("- Today's sunshine: 3.2 h", body)
         self.assertIn("- Night reference sunshine: n/a", body)
 
+    @patch("vrm_solar_automation.notifier.smtplib.SMTP")
+    def test_plug_mismatch_email_reports_expected_and_observed_state(
+        self,
+        mock_smtp: MagicMock,
+    ) -> None:
+        notifier = self._build_notifier()
+
+        notifier.send_plug_state_mismatch_email(
+            at_iso="2026-01-10T12:34:56+00:00",
+            intended_is_on=True,
+            observed_is_on=False,
+            decision_action="keep_on",
+            decision_reason="Automatic demand remains on.",
+            actuation_status="no_target_change",
+        )
+
+        message = self._extract_message(mock_smtp)
+        body = message.get_content()
+
+        self.assertEqual(message["Subject"], "VRM Alert: Plug state mismatch detected")
+        self.assertIn("- Time: 2026-01-10 13:34", body)
+        self.assertIn("- Automation target: On", body)
+        self.assertIn("- Observed plug state: Off", body)
+        self.assertIn("- Action: Keep On", body)
+        self.assertIn("- Actuation result: No target change", body)
+
 
 if __name__ == "__main__":
     unittest.main()

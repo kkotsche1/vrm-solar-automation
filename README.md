@@ -6,7 +6,7 @@ Python automation for a Cerbo GX and Shelly-controlled circulation pump. The pro
 
 - `metrics`: fetch the current Cerbo GX power snapshot over Modbus TCP
 - `decide`: evaluate the automatic pump policy without actuating the plug
-- `control`: evaluate the policy and reconcile the Shelly plug when a fresh automatic state transition occurs
+- `control`: evaluate the policy and reconcile the Shelly plug whenever the observed reachable state diverges from the intended automatic target
 - `db-upgrade`: apply Alembic migrations to create/update the automation database schema
 - `plug-*`: inspect or manually control the Shelly plug directly
 - `scripts/pump_control_snapshot.py`: run one controller cycle from a plain Python script for Raspberry Pi scheduling
@@ -16,18 +16,16 @@ Python automation for a Cerbo GX and Shelly-controlled circulation pump. The pro
 Email notifications are sent for:
 
 - Shelly plug state changes initiated by the controller
+- observed Shelly state mismatch versus the automatic target (sent once per mismatch episode until the states align again)
 - battery SOC dropping below `40%`, `35%`, and `30%`
 - generator power being detected at `100 W` or higher
 - weather-based forecast blocks that keep automation `OFF` (sent at most once per weather-local day)
 
 Notification emails are formatted for human readability: concise subjects, plain-language labels (no internal action tags), and bullet-list bodies with local date/time (`YYYY-MM-DD HH:MM`).
 
-Battery and generator alerts are latched in the database, so a one-shot scheduler only sends one alert per active condition. The latch resets automatically after battery SOC recovers above the threshold or generator power disappears. Weather-block alerts are date-latched and send once per `WEATHER_TIMEZONE` day.
+Battery, generator, and plug-mismatch alerts are latched in the database, so a one-shot scheduler only sends one alert per active condition. The latch resets automatically after battery SOC recovers above the threshold, generator power disappears, or the observed plug state realigns with the automatic target. Weather-block alerts are date-latched and send once per `WEATHER_TIMEZONE` day.
 
-Manual override is no longer stored in the backend. If the plug is changed in the Shelly app, the automation waits for a fresh automatic transition before reasserting the plug state:
-
-- automatic `ON`, manual Shelly `OFF`: wait for automatic `OFF`, then a new automatic `ON`
-- automatic `OFF`, manual Shelly `ON`: wait for automatic `ON`, then a new automatic `OFF`
+Manual override is no longer stored in the backend. If the plug is changed in the Shelly app and the controller can still reach the Shelly, the next control cycle reasserts the automatic target. If the Shelly is temporarily unreachable, the controller waits until it can read the plug state again before retrying alignment.
 
 ## Setup
 
@@ -317,7 +315,7 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 
 The runtime state still lets one-shot scheduling tolerate manual Shelly changes without introducing a separate override system. It also persists whether the previous cycle was quiet-hours-forced so a one-shot scheduler can turn the plug back on correctly when the quiet-hours window ends.
 
-The same singleton runtime row also stores the alert latches for the `40%`, `35%`, and `30%` battery warnings plus the generator-running warning and the weather-block daily notification date.
+The same singleton runtime row also stores the alert latches for the `40%`, `35%`, and `30%` battery warnings, the generator-running warning, the plug-mismatch warning, and the weather-block daily notification date.
 
 The same singleton runtime row also stores the Cerbo telemetry failure streak plus the last Cerbo failure timestamp and error text. That is what lets the controller distinguish between a one-off transient read failure and a sustained outage before forcing the pump off.
 

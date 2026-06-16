@@ -111,6 +111,34 @@ class GmailSmtpNotifier:
             ),
         )
 
+    def send_plug_state_mismatch_email(
+        self,
+        *,
+        at_iso: str,
+        intended_is_on: bool,
+        observed_is_on: bool,
+        decision_action: str,
+        decision_reason: str,
+        actuation_status: str,
+    ) -> None:
+        self._send_email(
+            subject="VRM Alert: Plug state mismatch detected",
+            body_lines=self._build_body(
+                headline=(
+                    "Automation target does not match the observed Shelly plug state. "
+                    "Manual intervention may be required."
+                ),
+                fields=(
+                    ("Time", self._format_local_timestamp(at_iso)),
+                    ("Automation target", self._format_bool(intended_is_on)),
+                    ("Observed plug state", self._format_bool(observed_is_on)),
+                    ("Action", self._humanize_token(decision_action)),
+                    ("Reason", decision_reason),
+                    ("Actuation result", self._humanize_token(actuation_status)),
+                ),
+            ),
+        )
+
     def _send_email(
         self,
         *,
