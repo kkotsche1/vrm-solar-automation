@@ -151,10 +151,7 @@ class CerboProbeClient:
         ]
         active_input_source = self._read_optional_input_register(REGISTER_ACTIVE_INPUT_SOURCE)
 
-        # Battery power is read mainly to validate register coherence and for
-        # future policy refinements, but the current snapshot exposes the core
-        # control inputs only.
-        _battery_power_w = uint16_to_int16(battery_power_raw)
+        battery_power_w = float(uint16_to_int16(battery_power_raw))
         dc_pv_watts = max(0, uint16_to_int16(solar_power_raw))
         ac_pv_watts = sum(
             max(0, uint16_to_int16(raw))
@@ -189,6 +186,7 @@ class CerboProbeClient:
             generator_watts=generator_watts,
             active_input_source=active_input_source,
             queried_at_unix_ms=queried_at_unix_ms,
+            battery_power_w=battery_power_w,
         )
 
     def _read_optional_input_register(self, register: int) -> int | None:

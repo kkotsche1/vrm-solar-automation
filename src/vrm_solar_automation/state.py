@@ -45,9 +45,9 @@ class StateStore:
                 consecutive_power_failures=int(row.consecutive_power_failures or 0),
                 last_power_failure_at_iso=row.last_power_failure_at_iso,
                 last_power_failure_error=row.last_power_failure_error,
-                battery_alert_below_40_sent=bool(row.battery_alert_below_40_sent),
-                battery_alert_below_35_sent=bool(row.battery_alert_below_35_sent),
-                battery_alert_below_30_sent=bool(row.battery_alert_below_30_sent),
+                battery_alert_latched_percents=_decode_percents(
+                    row.battery_alert_latched_percents
+                ),
                 generator_running_alert_sent=bool(row.generator_running_alert_sent),
                 weather_block_alert_sent_local_date=row.weather_block_alert_sent_local_date,
                 plug_mismatch_alert_sent=bool(row.plug_mismatch_alert_sent),
@@ -79,9 +79,9 @@ class StateStore:
                     consecutive_power_failures=state.consecutive_power_failures,
                     last_power_failure_at_iso=state.last_power_failure_at_iso,
                     last_power_failure_error=state.last_power_failure_error,
-                    battery_alert_below_40_sent=state.battery_alert_below_40_sent,
-                    battery_alert_below_35_sent=state.battery_alert_below_35_sent,
-                    battery_alert_below_30_sent=state.battery_alert_below_30_sent,
+                    battery_alert_latched_percents=_encode_percents(
+                        state.battery_alert_latched_percents
+                    ),
                     generator_running_alert_sent=state.generator_running_alert_sent,
                     weather_block_alert_sent_local_date=state.weather_block_alert_sent_local_date,
                     plug_mismatch_alert_sent=state.plug_mismatch_alert_sent,
@@ -108,9 +108,9 @@ class StateStore:
                 row.consecutive_power_failures = state.consecutive_power_failures
                 row.last_power_failure_at_iso = state.last_power_failure_at_iso
                 row.last_power_failure_error = state.last_power_failure_error
-                row.battery_alert_below_40_sent = state.battery_alert_below_40_sent
-                row.battery_alert_below_35_sent = state.battery_alert_below_35_sent
-                row.battery_alert_below_30_sent = state.battery_alert_below_30_sent
+                row.battery_alert_latched_percents = _encode_percents(
+                    state.battery_alert_latched_percents
+                )
                 row.generator_running_alert_sent = state.generator_running_alert_sent
                 row.weather_block_alert_sent_local_date = state.weather_block_alert_sent_local_date
                 row.plug_mismatch_alert_sent = state.plug_mismatch_alert_sent
@@ -152,7 +152,10 @@ class StateStore:
         quiet_hours_blocked: bool,
         blocked_reason: str | None,
         actuation: dict[str, object],
+        plug_observed_is_on: bool | None = None,
+        policy_fingerprint: dict[str, object] | None = None,
     ) -> None:
+        fingerprint = policy_fingerprint or {}
         with self._session_factory() as session:
             session.add(
                 ControlCycleRecord(
@@ -164,6 +167,7 @@ class StateStore:
                     power_queried_at_unix_ms=_optional_int(power.get("queried_at_unix_ms")),
                     power_queried_at_iso=_optional_str(power.get("queried_at_iso")),
                     battery_soc_percent=_optional_float(power.get("battery_soc_percent")),
+                    battery_power_w=_optional_float(power.get("battery_power_w")),
                     solar_watts=_optional_float(power.get("solar_watts")),
                     house_watts=_optional_float(power.get("house_watts")),
                     house_l1_watts=_optional_float(power.get("house_l1_watts")),
@@ -206,6 +210,16 @@ class StateStore:
                         actuation.get("observed_after_is_on")
                     ),
                     actuation_error=_optional_str(actuation.get("error")),
+                    plug_observed_is_on=_optional_bool(plug_observed_is_on),
+                    policy_battery_capacity_kwh=_optional_float(
+                        fingerprint.get("battery_capacity_kwh")
+                    ),
+                    policy_night_base_load_kw=_optional_float(
+                        fingerprint.get("night_base_load_kw")
+                    ),
+                    policy_battery_hard_min_soc_percent=_optional_float(
+                        fingerprint.get("battery_hard_min_soc_percent")
+                    ),
                 )
             )
             session.commit()
@@ -235,6 +249,27 @@ class StateStore:
             changed_at_iso=datetime.now(UTC).isoformat(),
             quiet_hours_forced_off=quiet_hours_forced_off,
         )
+
+
+def _encode_percents(percents: tuple[float, ...]) -> str | None:
+    if not percents:
+        return None
+    return ",".join(f"{percent:g}" for percent in percents)
+
+
+def _decode_percents(raw: str | None) -> tuple[float, ...]:
+    if not raw:
+        return ()
+    percents = []
+    for entry in raw.split(","):
+        candidate = entry.strip()
+        if not candidate:
+            continue
+        try:
+            percents.append(float(candidate))
+        except ValueError:
+            continue
+    return tuple(percents)
 
 
 def _optional_float(value: object) -> float | None:

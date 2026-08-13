@@ -51,10 +51,10 @@ class GmailSmtpNotifier:
         self,
         *,
         battery_soc_percent: float,
-        crossed_thresholds: tuple[int, ...],
+        crossed_thresholds: tuple[float, ...],
         at_iso: str,
     ) -> None:
-        thresholds_text = ", ".join(f"{threshold}%" for threshold in crossed_thresholds)
+        thresholds_text = ", ".join(f"{threshold:g}%" for threshold in crossed_thresholds)
         self._send_email(
             subject=f"VRM Alert: Battery SOC low ({battery_soc_percent:.1f}%)",
             body_lines=self._build_body(

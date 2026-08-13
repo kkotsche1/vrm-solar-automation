@@ -27,22 +27,19 @@ class Settings:
     sunshine_hours_min: float = 6.5
     battery_min_soc_percent: float = 55.0
     battery_soft_min_soc_percent: float = 35.0
-    battery_hard_min_soc_percent: float = 30.0
+    battery_hard_min_soc_percent: float = 22.5
     battery_capacity_kwh: float = 50.0
+    battery_alert_soc_percents: tuple[float, ...] = (35.0, 25.0)
+    battery_alert_rearm_margin_percent: float = 5.0
     auto_off_start_local: str = "18:00"
     auto_resume_start_local: str = "08:00"
-    day_morning_bias_end_local: str = "11:00"
     auto_control_timezone: str = "Europe/Madrid"
     forecast_liberal_sunshine_hours_min: float = 9.0
     forecast_liberal_sunshine_hours_max: float = 12.0
     surplus_night_enabled: bool = True
     surplus_night_base_load_kw: float = 1.5
-    surplus_night_hard_min_soc_percent: float = 25.0
-    surplus_night_buffer_soc_percent: float = 5.0
     surplus_night_turn_on_margin_soc_percent: float = 10.0
-    surplus_night_turn_off_margin_soc_percent: float = 5.0
     surplus_night_min_turn_on_margin_soc_percent: float = 7.0
-    surplus_night_min_turn_off_margin_soc_percent: float = 2.0
     surplus_night_next_day_sunshine_min: float = 9.0
     state_file: str = ".state/pump-policy-state.json"
     database_url: str = "sqlite:///.state/automation.db"
@@ -132,12 +129,20 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         key="BATTERY_SOFT_MIN_SOC_PERCENT",
     )
     battery_hard_min_soc_percent = _parse_percent(
-        values.get("BATTERY_HARD_MIN_SOC_PERCENT", "30"),
+        values.get("BATTERY_HARD_MIN_SOC_PERCENT", "22.5"),
         key="BATTERY_HARD_MIN_SOC_PERCENT",
     )
     battery_capacity_kwh = _parse_non_negative_float(
         values.get("BATTERY_CAPACITY_KWH", "50"),
         key="BATTERY_CAPACITY_KWH",
+    )
+    battery_alert_soc_percents = _parse_percent_list(
+        values.get("BATTERY_ALERT_SOC_PERCENTS", "35,25"),
+        key="BATTERY_ALERT_SOC_PERCENTS",
+    )
+    battery_alert_rearm_margin_percent = _parse_non_negative_float(
+        values.get("BATTERY_ALERT_REARM_MARGIN_PERCENT", "5"),
+        key="BATTERY_ALERT_REARM_MARGIN_PERCENT",
     )
     forecast_liberal_sunshine_hours_min = _parse_hours(
         values.get("FORECAST_LIBERAL_SUNSHINE_HOURS_MIN", "9.0"),
@@ -147,29 +152,13 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         values.get("FORECAST_LIBERAL_SUNSHINE_HOURS_MAX", "12.0"),
         key="FORECAST_LIBERAL_SUNSHINE_HOURS_MAX",
     )
-    surplus_night_hard_min_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT", "25"),
-        key="SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT",
-    )
-    surplus_night_buffer_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_BUFFER_SOC_PERCENT", "5"),
-        key="SURPLUS_NIGHT_BUFFER_SOC_PERCENT",
-    )
     surplus_night_turn_on_margin_soc_percent = _parse_percent(
         values.get("SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT", "10"),
         key="SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT",
     )
-    surplus_night_turn_off_margin_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT", "5"),
-        key="SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT",
-    )
     surplus_night_min_turn_on_margin_soc_percent = _parse_percent(
         values.get("SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT", "7"),
         key="SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT",
-    )
-    surplus_night_min_turn_off_margin_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT", "2"),
-        key="SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT",
     )
     surplus_night_next_day_sunshine_min = _parse_hours(
         values.get("SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN", "9.0"),
@@ -199,14 +188,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             "SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT must be less than or equal to "
             "SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT."
         )
-    if (
-        surplus_night_min_turn_off_margin_soc_percent
-        > surplus_night_turn_off_margin_soc_percent
-    ):
-        raise ValueError(
-            "SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT must be less than or equal to "
-            "SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT."
-        )
 
     return Settings(
         email=values.get("VICTRON_EMAIL"),
@@ -233,6 +214,8 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         battery_soft_min_soc_percent=battery_soft_min_soc_percent,
         battery_hard_min_soc_percent=battery_hard_min_soc_percent,
         battery_capacity_kwh=battery_capacity_kwh,
+        battery_alert_soc_percents=battery_alert_soc_percents,
+        battery_alert_rearm_margin_percent=battery_alert_rearm_margin_percent,
         auto_off_start_local=_parse_local_hhmm(
             values.get("AUTO_OFF_START_LOCAL", "18:00"),
             key="AUTO_OFF_START_LOCAL",
@@ -240,10 +223,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         auto_resume_start_local=_parse_local_hhmm(
             values.get("AUTO_RESUME_START_LOCAL", "08:00"),
             key="AUTO_RESUME_START_LOCAL",
-        ),
-        day_morning_bias_end_local=_parse_local_hhmm(
-            values.get("DAY_MORNING_BIAS_END_LOCAL", "11:00"),
-            key="DAY_MORNING_BIAS_END_LOCAL",
         ),
         auto_control_timezone=auto_control_timezone,
         forecast_liberal_sunshine_hours_min=forecast_liberal_sunshine_hours_min,
@@ -255,15 +234,9 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             "on",
         },
         surplus_night_base_load_kw=surplus_night_base_load_kw,
-        surplus_night_hard_min_soc_percent=surplus_night_hard_min_soc_percent,
-        surplus_night_buffer_soc_percent=surplus_night_buffer_soc_percent,
         surplus_night_turn_on_margin_soc_percent=surplus_night_turn_on_margin_soc_percent,
-        surplus_night_turn_off_margin_soc_percent=surplus_night_turn_off_margin_soc_percent,
         surplus_night_min_turn_on_margin_soc_percent=(
             surplus_night_min_turn_on_margin_soc_percent
-        ),
-        surplus_night_min_turn_off_margin_soc_percent=(
-            surplus_night_min_turn_off_margin_soc_percent
         ),
         surplus_night_next_day_sunshine_min=surplus_night_next_day_sunshine_min,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),
@@ -327,6 +300,16 @@ def _parse_percent(value: str, *, key: str) -> float:
     return candidate
 
 
+def _parse_percent_list(value: str, *, key: str) -> tuple[float, ...]:
+    entries = _parse_csv_list(value)
+    if not entries:
+        return ()
+    percents = tuple(_parse_percent(entry, key=key) for entry in entries)
+    if len(set(percents)) != len(percents):
+        raise ValueError(f"{key} must not contain duplicate percentages.")
+    return tuple(sorted(percents, reverse=True))
+
+
 def _parse_hours(value: str, *, key: str) -> float:
     try:
         candidate = float(value)
@@ -367,6 +350,11 @@ def _reject_removed_keys(values: dict[str, str]) -> None:
         "SUMMER_AUTO_RESUME_START_LOCAL",
         "WINTER_AUTO_OFF_START_LOCAL",
         "WINTER_AUTO_RESUME_START_LOCAL",
+        "DAY_MORNING_BIAS_END_LOCAL",
+        "SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT",
+        "SURPLUS_NIGHT_BUFFER_SOC_PERCENT",
+        "SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT",
+        "SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT",
     )
     present = [key for key in removed_keys if key in values]
     if present:

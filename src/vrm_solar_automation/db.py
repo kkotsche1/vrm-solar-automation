@@ -23,15 +23,7 @@ class ControllerStateRecord(Base):
     consecutive_power_failures: Mapped[int] = mapped_column(INTEGER, nullable=False, default=0)
     last_power_failure_at_iso: Mapped[str | None] = mapped_column(String(40))
     last_power_failure_error: Mapped[str | None] = mapped_column(TEXT)
-    battery_alert_below_40_sent: Mapped[bool] = mapped_column(
-        BOOLEAN, nullable=False, default=False
-    )
-    battery_alert_below_35_sent: Mapped[bool] = mapped_column(
-        BOOLEAN, nullable=False, default=False
-    )
-    battery_alert_below_30_sent: Mapped[bool] = mapped_column(
-        BOOLEAN, nullable=False, default=False
-    )
+    battery_alert_latched_percents: Mapped[str | None] = mapped_column(String(128))
     generator_running_alert_sent: Mapped[bool] = mapped_column(
         BOOLEAN, nullable=False, default=False
     )
@@ -67,6 +59,7 @@ class ControlCycleRecord(Base):
     power_queried_at_unix_ms: Mapped[int | None] = mapped_column(BIGINT)
     power_queried_at_iso: Mapped[str | None] = mapped_column(String(40))
     battery_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
+    battery_power_w: Mapped[float | None] = mapped_column(FLOAT)
     solar_watts: Mapped[float | None] = mapped_column(FLOAT)
     house_watts: Mapped[float | None] = mapped_column(FLOAT)
     house_l1_watts: Mapped[float | None] = mapped_column(FLOAT)
@@ -107,6 +100,17 @@ class ControlCycleRecord(Base):
     actuation_observed_before_is_on: Mapped[bool | None] = mapped_column(BOOLEAN)
     actuation_observed_after_is_on: Mapped[bool | None] = mapped_column(BOOLEAN)
     actuation_error: Mapped[str | None] = mapped_column(TEXT)
+
+    # The plug's actual state this cycle, written on every reachable cycle regardless of
+    # whether an actuation happened. NULL means the plug was unreachable, which marks the
+    # period as unusable for analysis rather than silently looking like "off".
+    plug_observed_is_on: Mapped[bool | None] = mapped_column(BOOLEAN)
+
+    # Self-describing fingerprint of the constants that produced this decision, so a
+    # dataset spanning a retune stays interpretable.
+    policy_battery_capacity_kwh: Mapped[float | None] = mapped_column(FLOAT)
+    policy_night_base_load_kw: Mapped[float | None] = mapped_column(FLOAT)
+    policy_battery_hard_min_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
 
 
 Index("ix_control_cycle_timestamp_unix_ms", ControlCycleRecord.timestamp_unix_ms)

@@ -48,6 +48,8 @@ class StateRepository(Protocol):
         quiet_hours_blocked: bool,
         blocked_reason: str | None,
         actuation: dict[str, object],
+        plug_observed_is_on: bool | None = None,
+        policy_fingerprint: dict[str, object] | None = None,
     ) -> None: ...
 
 
@@ -103,11 +105,13 @@ class PumpControlSystem:
             sunshine_hours_min=settings.sunshine_hours_min,
             forecast_liberal_sunshine_hours_min=settings.forecast_liberal_sunshine_hours_min,
             forecast_liberal_sunshine_hours_max=settings.forecast_liberal_sunshine_hours_max,
-            auto_resume_start_local=settings.auto_resume_start_local,
-            day_morning_bias_end_local=settings.day_morning_bias_end_local,
+            battery_alert_soc_percents=settings.battery_alert_soc_percents,
+            battery_alert_rearm_margin_percent=settings.battery_alert_rearm_margin_percent,
         )
         self._policy = policy or PumpPolicy(policy_config)
-        self._generator_alert_threshold_watts = policy_config.generator_on_block_watts
+        self._generator_alert_threshold_watts = policy_config.generator_alert_watts
+        self._battery_alert_soc_percents = policy_config.battery_alert_soc_percents
+        self._battery_alert_rearm_margin_percent = policy_config.battery_alert_rearm_margin_percent
         self._weather_client = weather_client or OpenMeteoClient()
         self._probe_client = probe_client or VrmProbeClient(settings)
         self._plug_client = plug_client
@@ -132,19 +136,11 @@ class PumpControlSystem:
         self._weather_timezone = ZoneInfo(settings.weather_timezone)
         self._surplus_night_enabled = settings.surplus_night_enabled
         self._surplus_night_base_load_kw = settings.surplus_night_base_load_kw
-        self._surplus_night_hard_min_soc_percent = settings.surplus_night_hard_min_soc_percent
-        self._surplus_night_buffer_soc_percent = settings.surplus_night_buffer_soc_percent
         self._surplus_night_turn_on_margin_soc_percent = (
             settings.surplus_night_turn_on_margin_soc_percent
         )
-        self._surplus_night_turn_off_margin_soc_percent = (
-            settings.surplus_night_turn_off_margin_soc_percent
-        )
         self._surplus_night_min_turn_on_margin_soc_percent = (
             settings.surplus_night_min_turn_on_margin_soc_percent
-        )
-        self._surplus_night_min_turn_off_margin_soc_percent = (
-            settings.surplus_night_min_turn_off_margin_soc_percent
         )
         self._surplus_night_next_day_sunshine_min = settings.surplus_night_next_day_sunshine_min
         self._battery_capacity_kwh = settings.battery_capacity_kwh
@@ -258,6 +254,7 @@ class PumpControlSystem:
         final_state = self._apply_alert_state(
             final_state,
             power=power,
+            power_status=power_status,
             decision=decision,
             weather=weather,
         )
@@ -293,6 +290,8 @@ class PumpControlSystem:
             quiet_hours_blocked=bool(payload["quiet_hours_blocked"]),
             blocked_reason=payload["blocked_reason"],
             actuation=payload["actuation"],
+            plug_observed_is_on=self._observed_plug_state(actuation),
+            policy_fingerprint=self._policy_fingerprint(),
         )
         return decision, payload
 
@@ -340,7 +339,6 @@ class PumpControlSystem:
             power=power,
             weather=weather,
             previous_state=previous_state,
-            now=local_now,
         )
         if self._is_within_quiet_hours(local_now=local_now):
             if self._surplus_night_enabled:
@@ -772,46 +770,35 @@ class PumpControlSystem:
         state: PumpPolicyState,
         *,
         power: PowerSnapshot,
+        power_status: TelemetryStatus,
         decision: PumpDecision,
         weather: WeatherSnapshot,
     ) -> PumpPolicyState:
-        battery_soc = power.battery_soc_percent
-        generator_watts = abs(power.generator_watts or 0.0)
-        crossed_thresholds: list[int] = []
-
-        battery_alert_below_40_sent = self._should_keep_battery_alert(
-            battery_soc=battery_soc,
-            threshold=40,
-            already_sent=state.battery_alert_below_40_sent,
-            crossed_thresholds=crossed_thresholds,
-        )
-        battery_alert_below_35_sent = self._should_keep_battery_alert(
-            battery_soc=battery_soc,
-            threshold=35,
-            already_sent=state.battery_alert_below_35_sent,
-            crossed_thresholds=crossed_thresholds,
-        )
-        battery_alert_below_30_sent = self._should_keep_battery_alert(
-            battery_soc=battery_soc,
-            threshold=30,
-            already_sent=state.battery_alert_below_30_sent,
-            crossed_thresholds=crossed_thresholds,
-        )
-
-        generator_running = generator_watts >= self._generator_alert_threshold_watts
+        battery_soc = power.battery_soc_percent if power_status.available else None
+        generator_watts = power.generator_watts if power_status.available else None
+        battery_alert_latched_percents = state.battery_alert_latched_percents
         generator_running_alert_sent = state.generator_running_alert_sent
-        if generator_running:
-            if not generator_running_alert_sent:
-                self._send_generator_started_alert(generator_watts=generator_watts)
-                generator_running_alert_sent = True
-        else:
-            generator_running_alert_sent = False
 
-        if crossed_thresholds:
-            self._send_battery_alert(
-                battery_soc_percent=battery_soc,
-                crossed_thresholds=tuple(crossed_thresholds),
+        # Telemetry gaps leave every latch untouched: an unreachable Cerbo must not
+        # re-arm alerts that were already sent for the current discharge.
+        if battery_soc is not None:
+            battery_alert_latched_percents, crossed_thresholds = self._battery_alert_latches(
+                battery_soc=battery_soc,
+                latched_percents=battery_alert_latched_percents,
             )
+            if crossed_thresholds:
+                self._send_battery_alert(
+                    battery_soc_percent=battery_soc,
+                    crossed_thresholds=crossed_thresholds,
+                )
+
+        if generator_watts is not None:
+            if abs(generator_watts) >= self._generator_alert_threshold_watts:
+                if not generator_running_alert_sent:
+                    self._send_generator_started_alert(generator_watts=abs(generator_watts))
+                    generator_running_alert_sent = True
+            else:
+                generator_running_alert_sent = False
 
         weather_block_alert_sent_local_date = state.weather_block_alert_sent_local_date
         weather_local_date = self._weather_local_date().isoformat()
@@ -829,9 +816,7 @@ class PumpControlSystem:
 
         return replace(
             state,
-            battery_alert_below_40_sent=battery_alert_below_40_sent,
-            battery_alert_below_35_sent=battery_alert_below_35_sent,
-            battery_alert_below_30_sent=battery_alert_below_30_sent,
+            battery_alert_latched_percents=battery_alert_latched_percents,
             generator_running_alert_sent=generator_running_alert_sent,
             weather_block_alert_sent_local_date=weather_block_alert_sent_local_date,
         )
@@ -840,7 +825,7 @@ class PumpControlSystem:
         self,
         *,
         battery_soc_percent: float | None,
-        crossed_thresholds: tuple[int, ...],
+        crossed_thresholds: tuple[float, ...],
     ) -> None:
         if self._notifier is None or battery_soc_percent is None:
             return
@@ -905,19 +890,31 @@ class PumpControlSystem:
 
         return False
 
-    @staticmethod
-    def _should_keep_battery_alert(
+    def _battery_alert_latches(
+        self,
         *,
-        battery_soc: float | None,
-        threshold: int,
-        already_sent: bool,
-        crossed_thresholds: list[int],
-    ) -> bool:
-        if battery_soc is None or battery_soc > threshold:
-            return False
-        if not already_sent:
-            crossed_thresholds.append(threshold)
-        return True
+        battery_soc: float,
+        latched_percents: tuple[float, ...],
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """Return the next latch set plus the thresholds newly crossed this cycle.
+
+        A threshold alerts once when SOC reaches it and stays latched — including
+        while SOC keeps falling — until SOC recovers past the re-arm margin above it.
+        """
+        margin = self._battery_alert_rearm_margin_percent
+        crossed: list[float] = []
+        still_latched: list[float] = []
+
+        for threshold in self._battery_alert_soc_percents:
+            was_latched = _contains_percent(latched_percents, threshold)
+            if battery_soc <= threshold:
+                if not was_latched:
+                    crossed.append(threshold)
+                still_latched.append(threshold)
+            elif was_latched and battery_soc < threshold + margin:
+                still_latched.append(threshold)
+
+        return tuple(still_latched), tuple(crossed)
 
     def _decide_surplus_night(
         self,
@@ -928,7 +925,6 @@ class PumpControlSystem:
         local_now: datetime,
     ) -> PumpDecision:
         battery_soc = power.battery_soc_percent
-        generator_watts = abs(power.generator_watts or 0.0)
         required_soc = self._required_night_soc_percent(local_now=local_now)
         reference_label, reference_sunshine = self._night_reference_sunshine(
             weather=weather,
@@ -943,23 +939,13 @@ class PumpControlSystem:
         turn_on_threshold = None
         turn_off_threshold = None
         if liberal_factor is not None:
-            turn_on_margin = linear_interpolate(
+            # Cut off exactly at the reserve so the battery lands on the hard floor at resume
+            # time; the turn-on margin is pure hysteresis and does not raise the landing point.
+            turn_off_threshold = required_soc
+            turn_on_threshold = required_soc + linear_interpolate(
                 self._surplus_night_turn_on_margin_soc_percent,
                 self._surplus_night_min_turn_on_margin_soc_percent,
                 liberal_factor,
-            )
-            turn_off_margin = linear_interpolate(
-                self._surplus_night_turn_off_margin_soc_percent,
-                self._surplus_night_min_turn_off_margin_soc_percent,
-                liberal_factor,
-            )
-            turn_on_threshold = max(
-                self._battery_hard_min_soc_percent,
-                required_soc + turn_on_margin,
-            )
-            turn_off_threshold = max(
-                self._battery_hard_min_soc_percent,
-                required_soc + turn_off_margin,
             )
 
         if battery_soc is None:
@@ -972,21 +958,6 @@ class PumpControlSystem:
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
                 reason="Battery SOC is unavailable, so reserve-aware night control fails safe to off.",
-            )
-
-        if generator_watts >= self._generator_alert_threshold_watts:
-            return self._night_decision(
-                target_on=False,
-                previous_state=previous_state,
-                required_soc=required_soc,
-                reference_sunshine=reference_sunshine,
-                effective_turn_on_soc_percent=turn_on_threshold,
-                effective_turn_off_soc_percent=turn_off_threshold,
-                forecast_liberal_factor=liberal_factor,
-                reason=(
-                    f"Generator power is present at {generator_watts:.0f} W, so reserve-aware night "
-                    "control keeps the pump off."
-                ),
             )
 
         if reference_sunshine is None:
@@ -1119,14 +1090,13 @@ class PumpControlSystem:
         return "today", weather.today_sunshine_hours
 
     def _required_night_soc_percent(self, *, local_now: datetime) -> float:
+        """SOC needed right now for base load alone to land on the hard floor at resume time."""
         hours_until_resume = self._hours_until_resume(local_now=local_now)
-        reserve_soc = (
-            self._surplus_night_hard_min_soc_percent
-            + self._surplus_night_buffer_soc_percent
+        return (
+            self._battery_hard_min_soc_percent
             + ((hours_until_resume * self._surplus_night_base_load_kw) / self._battery_capacity_kwh)
             * 100.0
         )
-        return reserve_soc
 
     def _hours_until_resume(self, *, local_now: datetime) -> float:
         resume_today = local_now.replace(
@@ -1177,6 +1147,20 @@ class PumpControlSystem:
             "effective_turn_off_soc_percent": decision.effective_turn_off_soc_percent,
             "forecast_liberal_factor": decision.forecast_liberal_factor,
             "soc_control_mode": decision.soc_control_mode,
+        }
+
+    @staticmethod
+    def _observed_plug_state(actuation: PumpActuationResult) -> bool | None:
+        """The plug's real state this cycle; None only when it could not be read."""
+        if actuation.observed_after_is_on is not None:
+            return actuation.observed_after_is_on
+        return actuation.observed_before_is_on
+
+    def _policy_fingerprint(self) -> dict[str, object]:
+        return {
+            "battery_capacity_kwh": self._battery_capacity_kwh,
+            "night_base_load_kw": self._surplus_night_base_load_kw,
+            "battery_hard_min_soc_percent": self._battery_hard_min_soc_percent,
         }
 
     def _previous_intended_target_is_on(self, state: PumpPolicyState | None) -> bool | None:
@@ -1244,6 +1228,10 @@ class PumpControlSystem:
             weather_cache_queried_timezone=weather.queried_timezone,
             weather_cache_cached_at_iso=datetime.now(UTC).isoformat(),
         )
+
+
+def _contains_percent(percents: tuple[float, ...], candidate: float) -> bool:
+    return any(abs(percent - candidate) < 1e-6 for percent in percents)
 
 
 def _hhmm_to_minutes(value: str | None) -> int:

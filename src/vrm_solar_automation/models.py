@@ -19,6 +19,10 @@ class PowerSnapshot:
     house_l1_watts: float | None = None
     house_l2_watts: float | None = None
     house_l3_watts: float | None = None
+    # Signed battery flow: negative = discharging, positive = charging. Unlike SOC,
+    # which the BMS quantises to whole percent, this updates continuously, so it is
+    # the only field that supports exact energy accounting.
+    battery_power_w: float | None = None
 
     def to_dict(self) -> dict[str, float | int | str | None]:
         return asdict(self)
@@ -39,6 +43,7 @@ class PowerSnapshot:
         house_l1_watts: float | None = None,
         house_l2_watts: float | None = None,
         house_l3_watts: float | None = None,
+        battery_power_w: float | None = None,
     ) -> "PowerSnapshot":
         queried_at_iso = None
         if queried_at_unix_ms is not None:
@@ -61,4 +66,5 @@ class PowerSnapshot:
             active_input_source=active_input_source,
             queried_at_unix_ms=queried_at_unix_ms,
             queried_at_iso=queried_at_iso,
+            battery_power_w=battery_power_w,
         )

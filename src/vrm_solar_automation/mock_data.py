@@ -17,4 +17,5 @@ def build_mock_power_snapshot(settings: Settings) -> PowerSnapshot:
         generator_watts=0.0,
         active_input_source=240,
         queried_at_unix_ms=int(datetime.now(UTC).timestamp() * 1000),
+        battery_power_w=1910.0,
     )

@@ -61,7 +61,6 @@ class ConfigTests(unittest.TestCase):
                         "BATTERY_CAPACITY_KWH=50",
                         "FORECAST_LIBERAL_SUNSHINE_HOURS_MIN=9.0",
                         "FORECAST_LIBERAL_SUNSHINE_HOURS_MAX=12.0",
-                        "DAY_MORNING_BIAS_END_LOCAL=11:00",
                     ]
                 )
                 + "\n",
@@ -80,7 +79,43 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.battery_capacity_kwh, 50.0)
         self.assertEqual(settings.forecast_liberal_sunshine_hours_min, 9.0)
         self.assertEqual(settings.forecast_liberal_sunshine_hours_max, 12.0)
-        self.assertEqual(settings.day_morning_bias_end_local, "11:00")
+
+    def test_load_settings_parses_battery_alert_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "BATTERY_ALERT_SOC_PERCENTS=25, 35, 20",
+                        "BATTERY_ALERT_REARM_MARGIN_PERCENT=7.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            settings = load_settings(env_path)
+
+        self.assertEqual(settings.battery_alert_soc_percents, (35.0, 25.0, 20.0))
+        self.assertEqual(settings.battery_alert_rearm_margin_percent, 7.5)
+
+    def test_load_settings_defaults_battery_alert_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("SUNSHINE_HOURS_MIN=6.5\n", encoding="utf-8")
+
+            settings = load_settings(env_path)
+
+        self.assertEqual(settings.battery_alert_soc_percents, (35.0, 25.0))
+        self.assertEqual(settings.battery_alert_rearm_margin_percent, 5.0)
+
+    def test_load_settings_rejects_duplicate_battery_alert_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("BATTERY_ALERT_SOC_PERCENTS=35,35\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                load_settings(env_path)
 
     def test_load_settings_parses_surplus_night_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,12 +125,8 @@ class ConfigTests(unittest.TestCase):
                     [
                         "SURPLUS_NIGHT_ENABLED=false",
                         "SURPLUS_NIGHT_BASE_LOAD_KW=1.7",
-                        "SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT=25",
-                        "SURPLUS_NIGHT_BUFFER_SOC_PERCENT=6",
                         "SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=12",
-                        "SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT=7",
                         "SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT=8",
-                        "SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT=3",
                         "SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN=9.5",
                     ]
                 )
@@ -107,12 +138,8 @@ class ConfigTests(unittest.TestCase):
 
         self.assertFalse(settings.surplus_night_enabled)
         self.assertEqual(settings.surplus_night_base_load_kw, 1.7)
-        self.assertEqual(settings.surplus_night_hard_min_soc_percent, 25.0)
-        self.assertEqual(settings.surplus_night_buffer_soc_percent, 6.0)
         self.assertEqual(settings.surplus_night_turn_on_margin_soc_percent, 12.0)
-        self.assertEqual(settings.surplus_night_turn_off_margin_soc_percent, 7.0)
         self.assertEqual(settings.surplus_night_min_turn_on_margin_soc_percent, 8.0)
-        self.assertEqual(settings.surplus_night_min_turn_off_margin_soc_percent, 3.0)
         self.assertEqual(settings.surplus_night_next_day_sunshine_min, 9.5)
 
     def test_load_settings_rejects_invalid_sunshine_hours_threshold(self) -> None:
@@ -181,6 +208,22 @@ class ConfigTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 load_settings(env_path)
+
+    def test_load_settings_rejects_removed_morning_bias_and_night_buffer_keys(self) -> None:
+        for removed_key in (
+            "DAY_MORNING_BIAS_END_LOCAL=11:00",
+            "SURPLUS_NIGHT_HARD_MIN_SOC_PERCENT=25",
+            "SURPLUS_NIGHT_BUFFER_SOC_PERCENT=5",
+            "SURPLUS_NIGHT_TURN_OFF_MARGIN_SOC_PERCENT=5",
+            "SURPLUS_NIGHT_MIN_TURN_OFF_MARGIN_SOC_PERCENT=2",
+        ):
+            with self.subTest(removed_key=removed_key):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    env_path = Path(temp_dir) / ".env"
+                    env_path.write_text(f"{removed_key}\n", encoding="utf-8")
+
+                    with self.assertRaises(ValueError):
+                        load_settings(env_path)
 
     def test_load_settings_rejects_removed_seasonal_quiet_hours_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

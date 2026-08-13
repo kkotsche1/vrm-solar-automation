@@ -25,9 +25,7 @@ class StateStoreTests(unittest.TestCase):
                     consecutive_power_failures=2,
                     last_power_failure_at_iso=datetime(2026, 1, 1, 4, tzinfo=UTC).isoformat(),
                     last_power_failure_error="timed out",
-                    battery_alert_below_40_sent=True,
-                    battery_alert_below_35_sent=True,
-                    battery_alert_below_30_sent=False,
+                    battery_alert_latched_percents=(35.0, 25.0),
                     generator_running_alert_sent=True,
                     weather_block_alert_sent_local_date="2026-01-01",
                     plug_mismatch_alert_sent=True,
@@ -165,9 +163,10 @@ class StateStoreTests(unittest.TestCase):
         self.assertIn("consecutive_power_failures", columns)
         self.assertIn("last_power_failure_at_iso", columns)
         self.assertIn("last_power_failure_error", columns)
-        self.assertIn("battery_alert_below_40_sent", columns)
-        self.assertIn("battery_alert_below_35_sent", columns)
-        self.assertIn("battery_alert_below_30_sent", columns)
+        self.assertIn("battery_alert_latched_percents", columns)
+        self.assertNotIn("battery_alert_below_40_sent", columns)
+        self.assertNotIn("battery_alert_below_35_sent", columns)
+        self.assertNotIn("battery_alert_below_30_sent", columns)
         self.assertIn("generator_running_alert_sent", columns)
         self.assertIn("weather_block_alert_sent_local_date", columns)
         self.assertIn("plug_mismatch_alert_sent", columns)

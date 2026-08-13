@@ -52,7 +52,7 @@ class GmailSmtpNotifierTests(unittest.TestCase):
 
         notifier.send_battery_alert_email(
             battery_soc_percent=34.2,
-            crossed_thresholds=(40, 35),
+            crossed_thresholds=(35.0, 25.0),
             at_iso="2026-01-10T12:34:56+00:00",
         )
 
@@ -62,7 +62,7 @@ class GmailSmtpNotifierTests(unittest.TestCase):
         self.assertEqual(message["Subject"], "VRM Alert: Battery SOC low (34.2%)")
         self.assertIn("- Time: 2026-01-10 13:34", body)
         self.assertIn("- Battery SOC: 34.2%", body)
-        self.assertIn("- Thresholds crossed: 40%, 35%", body)
+        self.assertIn("- Thresholds crossed: 35%, 25%", body)
 
     @patch("vrm_solar_automation.notifier.smtplib.SMTP")
     def test_weather_blocked_email_uses_friendly_mode_label(self, mock_smtp: MagicMock) -> None:

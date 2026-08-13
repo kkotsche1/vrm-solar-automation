@@ -11,7 +11,11 @@ from vrm_solar_automation.db import create_engine_for_url, upgrade_database
 from vrm_solar_automation.config import Settings
 from vrm_solar_automation.models import PowerSnapshot
 from vrm_solar_automation.policy import PumpPolicy, PumpPolicyState
-from vrm_solar_automation.shelly import ShellySwitchCommandResult, ShellySwitchStatus
+from vrm_solar_automation.shelly import (
+    ShellyError,
+    ShellySwitchCommandResult,
+    ShellySwitchStatus,
+)
 from vrm_solar_automation.state import StateStore
 from vrm_solar_automation.system import PumpControlSystem
 from vrm_solar_automation.weather import WeatherSnapshot
@@ -136,6 +140,19 @@ class FakeStateStore:
         self.cycles.append(kwargs)
 
 
+class UnreachablePlugClient:
+    """Stands in for the July outage: every plug read fails."""
+
+    async def fetch_switch_status(self) -> ShellySwitchStatus:
+        raise ShellyError("plug unreachable")
+
+    async def turn_on(self) -> ShellySwitchCommandResult:
+        raise ShellyError("plug unreachable")
+
+    async def turn_off(self) -> ShellySwitchCommandResult:
+        raise ShellyError("plug unreachable")
+
+
 class FakeNotifier:
     def __init__(self, *, should_raise: bool = False) -> None:
         self.should_raise = should_raise
@@ -254,17 +271,26 @@ class FakeNotifier:
 
 
 class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
-    def test_generator_power_blocks_operation(self) -> None:
+    def test_generator_power_does_not_block_operation(self) -> None:
         decision = PumpPolicy().decide(
-            power=_build_power_snapshot(generator_watts=1200.0),
+            power=_build_power_snapshot(generator_watts=1200.0, battery_soc_percent=82.0),
             weather=_build_sunny_weather(),
             previous_state=None,
-            now=datetime(2026, 1, 10, tzinfo=UTC),
+        )
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(decision.action, "turn_on")
+        self.assertNotIn("Generator", decision.reason)
+
+    def test_generator_power_does_not_override_low_soc_cutoff(self) -> None:
+        decision = PumpPolicy().decide(
+            power=_build_power_snapshot(generator_watts=1200.0, battery_soc_percent=22.0),
+            weather=_build_sunny_weather(),
+            previous_state=None,
         )
 
         self.assertFalse(decision.should_turn_on)
-        self.assertEqual(decision.action, "turn_off")
-        self.assertIn("Generator power is present", decision.reason)
+        self.assertIn("hard automatic cutoff", decision.reason)
 
     def test_weather_unknown_keeps_operation_off(self) -> None:
         decision = PumpPolicy().decide(
@@ -278,7 +304,6 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 queried_timezone="Europe/Madrid",
             ),
             previous_state=None,
-            now=datetime(2026, 1, 10, tzinfo=UTC),
         )
 
         self.assertFalse(decision.should_turn_on)
@@ -290,7 +315,6 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             power=_build_power_snapshot(generator_watts=0.0),
             weather=_build_sunny_weather(today_sunshine_hours=3.5),
             previous_state=None,
-            now=datetime(2026, 1, 10, tzinfo=UTC),
         )
 
         self.assertFalse(decision.should_turn_on)
@@ -303,15 +327,14 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
         )
         decision = PumpPolicy().decide(
-            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=30.0),
+            power=_build_power_snapshot(generator_watts=0.0, battery_soc_percent=22.0),
             weather=_build_sunny_weather(),
             previous_state=previous_state,
-            now=datetime(2026, 1, 10, tzinfo=UTC),
         )
 
         self.assertFalse(decision.should_turn_on)
         self.assertEqual(decision.action, "turn_off")
-        self.assertIn("at or below the 30.0% hard automatic cutoff", decision.reason)
+        self.assertIn("at or below the 22.5% hard automatic cutoff", decision.reason)
 
     async def test_control_uses_configured_soc_threshold(self) -> None:
         system = PumpControlSystem(
@@ -331,7 +354,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["next_state"]["is_on"])
         self.assertIn("meeting the adaptive 45.0% turn-on threshold", decision.reason)
 
-    async def test_morning_resume_keeps_running_at_40_percent_with_strong_forecast(self) -> None:
+    async def test_morning_gets_no_keep_running_bias(self) -> None:
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
             is_on=True,
@@ -342,7 +365,6 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 battery_min_soc_percent=45.0,
                 auto_off_start_local="18:30",
                 auto_resume_start_local="08:30",
-                day_morning_bias_end_local="11:00",
                 auto_control_timezone="UTC",
                 surplus_night_enabled=False,
             ),
@@ -358,9 +380,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         decision, payload = await system.evaluate()
 
-        self.assertTrue(decision.should_turn_on)
-        self.assertEqual(decision.action, "keep_on")
-        self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 37.5, places=1)
+        self.assertFalse(decision.should_turn_on)
+        self.assertEqual(decision.action, "turn_off")
+        self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 40.0, places=1)
         self.assertAlmostEqual(float(payload["forecast_liberal_factor"]), 0.5, places=2)
 
     async def test_morning_resume_strong_forecast_can_restart_below_conservative_cutoff(self) -> None:
@@ -368,7 +390,6 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             _test_settings(
                 battery_min_soc_percent=45.0,
                 auto_resume_start_local="08:30",
-                day_morning_bias_end_local="11:00",
                 auto_control_timezone="UTC",
             ),
             probe_client=FakeProbeClient(
@@ -397,7 +418,6 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             _test_settings(
                 battery_min_soc_percent=45.0,
                 auto_resume_start_local="08:30",
-                day_morning_bias_end_local="11:00",
                 auto_control_timezone="UTC",
             ),
             probe_client=FakeProbeClient(
@@ -414,45 +434,48 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 45.0, places=1)
         self.assertIn("needs at least 45.0% SOC to keep running", decision.reason)
 
-    async def test_morning_bias_ends_after_configured_time(self) -> None:
-        state_store = FakeStateStore()
-        state_store.state = PumpPolicyState(
-            is_on=True,
-            changed_at_iso=datetime(2026, 1, 10, 8, 29, tzinfo=UTC).isoformat(),
-        )
-        system = PumpControlSystem(
-            _test_settings(
-                battery_min_soc_percent=45.0,
-                auto_resume_start_local="08:30",
-                day_morning_bias_end_local="11:00",
-                auto_control_timezone="UTC",
-            ),
-            probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=39.0)
-            ),
-            weather_client=FakeWeatherClient(
-                _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=10.5)
-            ),
-            state_store=state_store,
-            now_provider=_fixed_now(2026, 1, 10, 11, 1),
-        )
+    async def test_daytime_keep_running_threshold_is_time_independent(self) -> None:
+        thresholds = []
+        for hour, minute in ((8, 45), (11, 1), (16, 0)):
+            state_store = FakeStateStore()
+            state_store.state = PumpPolicyState(
+                is_on=True,
+                changed_at_iso=datetime(2026, 1, 10, 8, 29, tzinfo=UTC).isoformat(),
+            )
+            system = PumpControlSystem(
+                _test_settings(
+                    battery_min_soc_percent=45.0,
+                    auto_off_start_local="18:30",
+                    auto_resume_start_local="08:30",
+                    auto_control_timezone="UTC",
+                    surplus_night_enabled=False,
+                ),
+                probe_client=FakeProbeClient(
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=41.0)
+                ),
+                weather_client=FakeWeatherClient(
+                    _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=10.5)
+                ),
+                state_store=state_store,
+                now_provider=_fixed_now(2026, 1, 10, hour, minute),
+            )
 
-        decision, payload = await system.evaluate()
+            decision, payload = await system.evaluate()
 
-        self.assertFalse(decision.should_turn_on)
-        self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 40.0, places=1)
-        self.assertIn("needs at least 40.0% SOC to keep running", decision.reason)
+            self.assertTrue(decision.should_turn_on)
+            thresholds.append(float(payload["effective_turn_off_soc_percent"]))
+
+        self.assertEqual(thresholds, [40.0, 40.0, 40.0])
 
     async def test_daytime_hard_cutoff_overrides_strong_forecast(self) -> None:
         system = PumpControlSystem(
             _test_settings(
                 battery_min_soc_percent=45.0,
                 auto_resume_start_local="08:30",
-                day_morning_bias_end_local="11:00",
                 auto_control_timezone="UTC",
             ),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=30.0)
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=22.0)
             ),
             weather_client=FakeWeatherClient(
                 _build_sunny_weather(today_sunshine_hours=12.0, tomorrow_sunshine_hours=12.0)
@@ -464,14 +487,13 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         decision, _ = await system.evaluate()
 
         self.assertFalse(decision.should_turn_on)
-        self.assertIn("30.0% hard automatic cutoff", decision.reason)
+        self.assertIn("22.5% hard automatic cutoff", decision.reason)
 
     async def test_daytime_uses_weaker_tomorrow_forecast_for_soc_thresholds(self) -> None:
         system = PumpControlSystem(
             _test_settings(
                 battery_min_soc_percent=45.0,
                 auto_resume_start_local="08:30",
-                day_morning_bias_end_local="11:00",
                 auto_control_timezone="UTC",
             ),
             probe_client=FakeProbeClient(
@@ -496,7 +518,6 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             _test_settings(
                 battery_min_soc_percent=45.0,
                 auto_resume_start_local="08:30",
-                day_morning_bias_end_local="11:00",
                 auto_control_timezone="UTC",
             ),
             probe_client=FakeProbeClient(
@@ -890,7 +911,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["intended_target_is_on"])
         self.assertFalse(payload["quiet_hours_blocked"])
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 69.0, places=1)
+        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 61.5, places=1)
         self.assertAlmostEqual(float(payload["night_reference_sunshine_hours"]), 10.0, places=1)
 
     async def test_surplus_night_stays_off_when_tomorrow_is_not_sunny_enough(self) -> None:
@@ -925,7 +946,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 surplus_night_enabled=True,
             ),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=77.0)
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=70.0)
             ),
             weather_client=FakeWeatherClient(
                 _build_sunny_weather(today_sunshine_hours=6.0, tomorrow_sunshine_hours=10.0)
@@ -939,7 +960,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.should_turn_on)
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertFalse(payload["intended_target_is_on"])
-        self.assertIn("needs at least 78.0% SOC to turn on", decision.reason)
+        self.assertIn("needs at least 70.5% SOC to turn on", decision.reason)
 
     async def test_surplus_night_can_turn_on_after_midnight_with_lower_reserve(self) -> None:
         system = PumpControlSystem(
@@ -963,7 +984,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.should_turn_on)
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertTrue(payload["intended_target_is_on"])
-        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 48.0, places=1)
+        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 40.5, places=1)
         self.assertAlmostEqual(float(payload["night_reference_sunshine_hours"]), 10.0, places=1)
 
     async def test_surplus_night_uses_hysteresis_to_keep_running_until_off_threshold(self) -> None:
@@ -993,7 +1014,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.should_turn_on)
         self.assertEqual(decision.action, "keep_on")
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertIn("above the 73.0% keep-running threshold", decision.reason)
+        self.assertIn("above the 61.5% keep-running threshold", decision.reason)
 
     async def test_surplus_night_turns_off_when_soc_reaches_off_threshold(self) -> None:
         state_store = FakeStateStore()
@@ -1008,7 +1029,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 surplus_night_enabled=True,
             ),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=73.0)
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=61.0)
             ),
             weather_client=FakeWeatherClient(
                 _build_sunny_weather(today_sunshine_hours=6.0, tomorrow_sunshine_hours=10.0)
@@ -1022,9 +1043,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.should_turn_on)
         self.assertEqual(decision.action, "turn_off")
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertIn("needs at least 73.0% SOC to keep running", decision.reason)
+        self.assertIn("needs at least 61.5% SOC to keep running", decision.reason)
 
-    async def test_surplus_night_generator_override_keeps_pump_off(self) -> None:
+    async def test_surplus_night_ignores_generator_power(self) -> None:
         system = PumpControlSystem(
             _test_settings(
                 auto_off_start_local="18:00",
@@ -1043,9 +1064,67 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         decision, payload = await system.evaluate()
 
-        self.assertFalse(decision.should_turn_on)
+        self.assertTrue(decision.should_turn_on)
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertIn("Generator power is present", decision.reason)
+        self.assertNotIn("Generator", decision.reason)
+
+    async def test_cycle_records_battery_power_and_policy_fingerprint(self) -> None:
+        state_store = FakeStateStore()
+        system = PumpControlSystem(
+            _test_settings(battery_capacity_kwh=50.0, surplus_night_base_load_kw=1.5),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_power_w=-1750.0)
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=state_store,
+            plug_client=FakePlugClient([True]),
+        )
+
+        await system.control()
+
+        cycle = state_store.cycles[-1]
+        self.assertEqual(cycle["power"]["battery_power_w"], -1750.0)
+        self.assertEqual(
+            cycle["policy_fingerprint"],
+            {
+                "battery_capacity_kwh": 50.0,
+                "night_base_load_kw": 1.5,
+                "battery_hard_min_soc_percent": 22.5,
+            },
+        )
+
+    async def test_plug_observed_state_is_recorded_without_a_target_change(self) -> None:
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 1, 10, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=state_store,
+            plug_client=FakePlugClient([True]),
+        )
+
+        _, payload = await system.control()
+
+        self.assertEqual(payload["actuation"]["status"], "no_target_change")
+        self.assertIs(state_store.cycles[-1]["plug_observed_is_on"], True)
+
+    async def test_plug_observed_state_is_null_when_plug_is_unreachable(self) -> None:
+        state_store = FakeStateStore()
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(_build_power_snapshot(generator_watts=0.0)),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=state_store,
+            plug_client=UnreachablePlugClient(),
+        )
+
+        await system.control()
+
+        self.assertIsNone(state_store.cycles[-1]["plug_observed_is_on"])
 
     async def test_reachable_mismatch_is_reconciled_even_without_target_change(self) -> None:
         notifier = FakeNotifier()
@@ -1164,44 +1243,104 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notifier.generator_alert_calls[1]["generator_watts"], 1500.0)
         self.assertTrue(payload["next_state"]["generator_running_alert_sent"])
 
-    async def test_battery_alerts_latch_until_soc_recovers(self) -> None:
+    async def test_battery_alerts_fire_once_per_threshold_while_soc_keeps_falling(self) -> None:
         notifier = FakeNotifier()
-        state_store = FakeStateStore()
         system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(
                 [
-                    _build_power_snapshot(battery_soc_percent=39.0),
-                    _build_power_snapshot(battery_soc_percent=34.0),
-                    _build_power_snapshot(battery_soc_percent=29.0),
-                    _build_power_snapshot(battery_soc_percent=29.0),
-                    _build_power_snapshot(battery_soc_percent=41.0),
-                    _build_power_snapshot(battery_soc_percent=39.0),
+                    _build_power_snapshot(battery_soc_percent=36.0),
+                    _build_power_snapshot(battery_soc_percent=35.0),
+                    _build_power_snapshot(battery_soc_percent=33.0),
+                    _build_power_snapshot(battery_soc_percent=30.0),
+                    _build_power_snapshot(battery_soc_percent=26.0),
+                    _build_power_snapshot(battery_soc_percent=25.0),
+                    _build_power_snapshot(battery_soc_percent=23.0),
                 ]
             ),
             weather_client=FakeWeatherClient(_build_sunny_weather()),
-            state_store=state_store,
+            state_store=FakeStateStore(),
+            notifier=notifier,
+        )
+
+        payloads = [(await system.control())[1] for _ in range(7)]
+
+        self.assertEqual(
+            [call["crossed_thresholds"] for call in notifier.battery_alert_calls],
+            [(35.0,), (25.0,)],
+        )
+        self.assertEqual(
+            [call["battery_soc_percent"] for call in notifier.battery_alert_calls],
+            [35.0, 25.0],
+        )
+        self.assertEqual(payloads[0]["next_state"]["battery_alert_latched_percents"], [])
+        self.assertEqual(payloads[2]["next_state"]["battery_alert_latched_percents"], [35.0])
+        self.assertEqual(
+            payloads[-1]["next_state"]["battery_alert_latched_percents"], [35.0, 25.0]
+        )
+
+    async def test_battery_alert_latches_survive_a_telemetry_gap(self) -> None:
+        notifier = FakeNotifier()
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                [
+                    _build_power_snapshot(battery_soc_percent=34.0),
+                    TimeoutError("cerbo timed out"),
+                    TimeoutError("cerbo timed out"),
+                    TimeoutError("cerbo timed out"),
+                    _build_power_snapshot(battery_soc_percent=33.0),
+                ]
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=FakeStateStore(),
             notifier=notifier,
         )
 
         await system.control()
-        await system.control()
-        await system.control()
-        await system.control()
-        recovery_decision, recovery_payload = await system.control()
-        _, final_payload = await system.control()
+        _, gap_payload = await system.control()
+        _, recovered_payload = await system.control()
 
-        self.assertFalse(recovery_decision.should_turn_on)
+        self.assertFalse(gap_payload["power_status"]["available"])
         self.assertEqual(
             [call["crossed_thresholds"] for call in notifier.battery_alert_calls],
-            [(40,), (35,), (30,), (40,)],
+            [(35.0,)],
         )
-        self.assertFalse(recovery_payload["next_state"]["battery_alert_below_40_sent"])
-        self.assertFalse(recovery_payload["next_state"]["battery_alert_below_35_sent"])
-        self.assertFalse(recovery_payload["next_state"]["battery_alert_below_30_sent"])
-        self.assertTrue(final_payload["next_state"]["battery_alert_below_40_sent"])
-        self.assertFalse(final_payload["next_state"]["battery_alert_below_35_sent"])
-        self.assertFalse(final_payload["next_state"]["battery_alert_below_30_sent"])
+        self.assertEqual(gap_payload["next_state"]["battery_alert_latched_percents"], [35.0])
+        self.assertEqual(recovered_payload["next_state"]["battery_alert_latched_percents"], [35.0])
+
+    async def test_battery_alert_rearms_only_after_soc_clears_the_margin(self) -> None:
+        notifier = FakeNotifier()
+        system = PumpControlSystem(
+            _test_settings(),
+            probe_client=FakeProbeClient(
+                [
+                    _build_power_snapshot(battery_soc_percent=34.0),
+                    _build_power_snapshot(battery_soc_percent=38.0),
+                    _build_power_snapshot(battery_soc_percent=34.0),
+                    _build_power_snapshot(battery_soc_percent=41.0),
+                    _build_power_snapshot(battery_soc_percent=34.0),
+                ]
+            ),
+            weather_client=FakeWeatherClient(_build_sunny_weather()),
+            state_store=FakeStateStore(),
+            notifier=notifier,
+        )
+
+        await system.control()
+        _, partial_recovery_payload = await system.control()
+        await system.control()
+        _, full_recovery_payload = await system.control()
+        await system.control()
+
+        self.assertEqual(
+            partial_recovery_payload["next_state"]["battery_alert_latched_percents"], [35.0]
+        )
+        self.assertEqual(full_recovery_payload["next_state"]["battery_alert_latched_percents"], [])
+        self.assertEqual(
+            [call["crossed_thresholds"] for call in notifier.battery_alert_calls],
+            [(35.0,), (35.0,)],
+        )
 
     async def test_weather_block_alert_is_sent_once_per_weather_day(self) -> None:
         notifier = FakeNotifier()
@@ -1286,22 +1425,22 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             notifier=notifier,
             now_provider=_fixed_now(2026, 1, 10, 10, 0),
         )
-        generator_system = PumpControlSystem(
+        hard_cutoff_system = PumpControlSystem(
             _test_settings(),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=1200.0, battery_soc_percent=90.0)
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=28.0)
             ),
-            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=3.0)),
+            weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=10.0)),
             state_store=state_store,
             notifier=notifier,
             now_provider=_fixed_now(2026, 1, 10, 10, 30),
         )
 
         low_soc_decision, _ = await low_soc_system.control()
-        generator_decision, _ = await generator_system.control()
+        hard_cutoff_decision, _ = await hard_cutoff_system.control()
 
         self.assertFalse(low_soc_decision.should_turn_on)
-        self.assertFalse(generator_decision.should_turn_on)
+        self.assertFalse(hard_cutoff_decision.should_turn_on)
         self.assertEqual(len(notifier.weather_block_alert_calls), 0)
 
     async def test_manual_shelly_off_during_automatic_on_reasserts_immediately(self) -> None:
@@ -1563,22 +1702,17 @@ def _test_settings(**overrides) -> Settings:
         "sunshine_hours_min": 6.5,
         "battery_min_soc_percent": 55.0,
         "battery_soft_min_soc_percent": 35.0,
-        "battery_hard_min_soc_percent": 30.0,
+        "battery_hard_min_soc_percent": 22.5,
         "battery_capacity_kwh": 50.0,
         "auto_off_start_local": "00:00",
         "auto_resume_start_local": "00:00",
-        "day_morning_bias_end_local": "11:00",
         "auto_control_timezone": "UTC",
         "forecast_liberal_sunshine_hours_min": 9.0,
         "forecast_liberal_sunshine_hours_max": 12.0,
         "surplus_night_enabled": True,
         "surplus_night_base_load_kw": 1.5,
-        "surplus_night_hard_min_soc_percent": 25.0,
-        "surplus_night_buffer_soc_percent": 5.0,
         "surplus_night_turn_on_margin_soc_percent": 10.0,
-        "surplus_night_turn_off_margin_soc_percent": 5.0,
         "surplus_night_min_turn_on_margin_soc_percent": 7.0,
-        "surplus_night_min_turn_off_margin_soc_percent": 2.0,
         "surplus_night_next_day_sunshine_min": 9.0,
         "state_file": ".state/test-pump-policy-state.json",
         "database_url": "sqlite:///.state/test-automation.db",
@@ -1595,6 +1729,7 @@ def _build_power_snapshot(
     solar_watts: float = 3200.0,
     house_watts: float = 900.0,
     generator_watts: float | None = 0.0,
+    battery_power_w: float | None = 2300.0,
 ) -> PowerSnapshot:
     return PowerSnapshot.with_timestamp(
         site_id=1,
@@ -1609,6 +1744,7 @@ def _build_power_snapshot(
         house_l1_watts=400.0,
         house_l2_watts=500.0,
         house_l3_watts=None,
+        battery_power_w=battery_power_w,
     )
 
 

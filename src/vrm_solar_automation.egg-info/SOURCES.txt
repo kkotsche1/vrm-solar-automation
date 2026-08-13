@@ -26,6 +26,7 @@ tests/test_cli.py
 tests/test_config.py
 tests/test_control_system.py
 tests/test_historical_weather.py
+tests/test_notifier.py
 tests/test_shelly.py
 tests/test_state.py
 tests/test_weather.py
