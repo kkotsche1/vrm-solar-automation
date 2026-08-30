@@ -41,6 +41,9 @@ class Settings:
     surplus_night_turn_on_margin_soc_percent: float = 10.0
     surplus_night_min_turn_on_margin_soc_percent: float = 7.0
     surplus_night_next_day_sunshine_min: float = 9.0
+    surplus_night_pump_load_kw: float = 4.5
+    surplus_night_forced_off_start_local: str = "23:30"
+    surplus_night_forced_off_end_local: str = "03:30"
     state_file: str = ".state/pump-policy-state.json"
     database_url: str = "sqlite:///.state/automation.db"
     database_auto_migrate: bool = False
@@ -168,6 +171,18 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         values.get("SURPLUS_NIGHT_BASE_LOAD_KW", "1.5"),
         key="SURPLUS_NIGHT_BASE_LOAD_KW",
     )
+    surplus_night_pump_load_kw = _parse_non_negative_float(
+        values.get("SURPLUS_NIGHT_PUMP_LOAD_KW", "4.5"),
+        key="SURPLUS_NIGHT_PUMP_LOAD_KW",
+    )
+    surplus_night_forced_off_start_local = _parse_local_hhmm(
+        values.get("SURPLUS_NIGHT_FORCED_OFF_START_LOCAL", "23:30"),
+        key="SURPLUS_NIGHT_FORCED_OFF_START_LOCAL",
+    )
+    surplus_night_forced_off_end_local = _parse_local_hhmm(
+        values.get("SURPLUS_NIGHT_FORCED_OFF_END_LOCAL", "03:30"),
+        key="SURPLUS_NIGHT_FORCED_OFF_END_LOCAL",
+    )
     if battery_hard_min_soc_percent > battery_soft_min_soc_percent:
         raise ValueError(
             "BATTERY_HARD_MIN_SOC_PERCENT must be less than or equal to "
@@ -239,6 +254,9 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             surplus_night_min_turn_on_margin_soc_percent
         ),
         surplus_night_next_day_sunshine_min=surplus_night_next_day_sunshine_min,
+        surplus_night_pump_load_kw=surplus_night_pump_load_kw,
+        surplus_night_forced_off_start_local=surplus_night_forced_off_start_local,
+        surplus_night_forced_off_end_local=surplus_night_forced_off_end_local,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),
         database_url=values.get("DATABASE_URL", "sqlite:///.state/automation.db"),
         database_auto_migrate=values.get("DATABASE_AUTO_MIGRATE", "false").lower() in {

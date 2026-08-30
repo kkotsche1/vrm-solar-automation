@@ -143,6 +143,9 @@ class PumpControlSystem:
             settings.surplus_night_min_turn_on_margin_soc_percent
         )
         self._surplus_night_next_day_sunshine_min = settings.surplus_night_next_day_sunshine_min
+        self._surplus_night_pump_load_kw = settings.surplus_night_pump_load_kw
+        self._forced_off_start_minutes = _hhmm_to_minutes(settings.surplus_night_forced_off_start_local)
+        self._forced_off_end_minutes = _hhmm_to_minutes(settings.surplus_night_forced_off_end_local)
         self._battery_capacity_kwh = settings.battery_capacity_kwh
         self._battery_hard_min_soc_percent = settings.battery_hard_min_soc_percent
         self._forecast_liberal_sunshine_hours_min = settings.forecast_liberal_sunshine_hours_min
@@ -926,6 +929,10 @@ class PumpControlSystem:
     ) -> PumpDecision:
         battery_soc = power.battery_soc_percent
         required_soc = self._required_night_soc_percent(local_now=local_now)
+        forced_off_active = self._is_within_forced_off_window(local_now=local_now)
+        forced_off_reserve = self._forced_off_window_reserve_soc_percent(local_now=local_now)
+        forced_off_reserve_soc_percent = forced_off_reserve if forced_off_active else None
+        reserve_soc = required_soc + forced_off_reserve
         reference_label, reference_sunshine = self._night_reference_sunshine(
             weather=weather,
             local_now=local_now,
@@ -941,12 +948,29 @@ class PumpControlSystem:
         if liberal_factor is not None:
             # Cut off exactly at the reserve so the battery lands on the hard floor at resume
             # time; the turn-on margin is pure hysteresis and does not raise the landing point.
-            turn_off_threshold = required_soc
-            turn_on_threshold = required_soc + linear_interpolate(
+            # Inside the forced-off window the reserve also covers the pump draw for the rest of
+            # the window, so the pump only runs there when there is genuine excess SOC.
+            turn_off_threshold = reserve_soc
+            turn_on_threshold = reserve_soc + linear_interpolate(
                 self._surplus_night_turn_on_margin_soc_percent,
                 self._surplus_night_min_turn_on_margin_soc_percent,
                 liberal_factor,
             )
+        blocked_subject = (
+            f"The {self._forced_off_window_label()} forced-off window"
+            if forced_off_active
+            else "Reserve-aware night control"
+        )
+        mode_phrase = (
+            f" through the {self._forced_off_window_label()} forced-off window"
+            if forced_off_active
+            else ""
+        )
+        reserve_clause = (
+            f" (including {forced_off_reserve:.1f}% to run the pump through the rest of the window)"
+            if forced_off_active
+            else ""
+        )
 
         if battery_soc is None:
             return self._night_decision(
@@ -957,6 +981,8 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
+                forced_off_window_active=forced_off_active,
+                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
                 reason="Battery SOC is unavailable, so reserve-aware night control fails safe to off.",
             )
 
@@ -969,6 +995,8 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=None,
                 effective_turn_off_soc_percent=None,
                 forecast_liberal_factor=None,
+                forced_off_window_active=forced_off_active,
+                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine-hours forecast is unavailable, so "
                     "reserve-aware night control keeps the pump off."
@@ -984,6 +1012,8 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
+                forced_off_window_active=forced_off_active,
+                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine forecast is {reference_sunshine:.1f} hours, "
                     f"below the {self._surplus_night_next_day_sunshine_min:.1f}-hour surplus-night minimum, "
@@ -1001,9 +1031,12 @@ class PumpControlSystem:
                     effective_turn_on_soc_percent=turn_on_threshold,
                     effective_turn_off_soc_percent=turn_off_threshold,
                     forecast_liberal_factor=liberal_factor,
+                    forced_off_window_active=forced_off_active,
+                    forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
                     reason=(
-                        f"Reserve-aware night control needs at least {turn_off_threshold:.1f}% SOC to keep "
-                        f"running, and battery SOC is {battery_soc:.1f}%, so the pump turns off."
+                        f"{blocked_subject} needs at least {turn_off_threshold:.1f}% SOC to keep "
+                        f"running{reserve_clause}, and battery SOC is {battery_soc:.1f}%, so the pump "
+                        "turns off."
                     ),
                 )
             return self._night_decision(
@@ -1014,10 +1047,13 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
+                forced_off_window_active=forced_off_active,
+                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
                 reason=(
-                    f"Reserve-aware night control stays on because {reference_label}'s sunshine forecast is "
-                    f"{reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, above the "
-                    f"{turn_off_threshold:.1f}% keep-running threshold."
+                    f"Reserve-aware night control stays on{mode_phrase} because {reference_label}'s "
+                    f"sunshine forecast is {reference_sunshine:.1f} hours and battery SOC is "
+                    f"{battery_soc:.1f}%, above the {turn_off_threshold:.1f}% keep-running "
+                    f"threshold{reserve_clause}."
                 ),
             )
 
@@ -1030,9 +1066,11 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
+                forced_off_window_active=forced_off_active,
+                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
                 reason=(
-                    f"Reserve-aware night control needs at least {turn_on_threshold:.1f}% SOC to turn on, "
-                    f"and battery SOC is {battery_soc:.1f}%, so the pump stays off."
+                    f"{blocked_subject} needs at least {turn_on_threshold:.1f}% SOC to turn on"
+                    f"{reserve_clause}, and battery SOC is {battery_soc:.1f}%, so the pump stays off."
                 ),
             )
 
@@ -1044,10 +1082,12 @@ class PumpControlSystem:
             effective_turn_on_soc_percent=turn_on_threshold,
             effective_turn_off_soc_percent=turn_off_threshold,
             forecast_liberal_factor=liberal_factor,
+            forced_off_window_active=forced_off_active,
+            forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
             reason=(
-                f"Reserve-aware night control can run because {reference_label}'s sunshine forecast is "
-                f"{reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, meeting the "
-                f"{turn_on_threshold:.1f}% turn-on threshold."
+                f"Reserve-aware night control can run{mode_phrase} because {reference_label}'s sunshine "
+                f"forecast is {reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, "
+                f"meeting the {turn_on_threshold:.1f}% turn-on threshold{reserve_clause}."
             ),
         )
 
@@ -1062,6 +1102,8 @@ class PumpControlSystem:
         effective_turn_off_soc_percent: float | None,
         forecast_liberal_factor: float | None,
         reason: str,
+        forced_off_window_active: bool = False,
+        forced_off_reserve_soc_percent: float | None = None,
     ) -> PumpDecision:
         return PumpDecision(
             should_turn_on=target_on,
@@ -1073,6 +1115,8 @@ class PumpControlSystem:
             night_required_soc_percent=required_soc,
             night_reference_sunshine_hours=reference_sunshine,
             night_surplus_mode_active=True,
+            night_forced_off_window_active=forced_off_window_active,
+            night_forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
             effective_turn_on_soc_percent=effective_turn_on_soc_percent,
             effective_turn_off_soc_percent=effective_turn_off_soc_percent,
             forecast_liberal_factor=forecast_liberal_factor,
@@ -1116,6 +1160,47 @@ class PumpControlSystem:
             resume_at = resume_today
         return max(0.0, (resume_at - local_now).total_seconds() / 3600.0)
 
+    def _is_within_forced_off_window(self, *, local_now: datetime) -> bool:
+        start = self._forced_off_start_minutes
+        end = self._forced_off_end_minutes
+        if start == end:
+            return False
+        current_minutes = (local_now.hour * 60) + local_now.minute
+        if start < end:
+            return start <= current_minutes < end
+        return current_minutes >= start or current_minutes < end
+
+    def _hours_until_forced_off_end(self, *, local_now: datetime) -> float:
+        if not self._is_within_forced_off_window(local_now=local_now):
+            return 0.0
+        end_today = local_now.replace(
+            hour=self._forced_off_end_minutes // 60,
+            minute=self._forced_off_end_minutes % 60,
+            second=0,
+            microsecond=0,
+        )
+        current_minutes = (local_now.hour * 60) + local_now.minute
+        if self._forced_off_start_minutes < self._forced_off_end_minutes:
+            end_at = end_today
+        elif current_minutes >= self._forced_off_start_minutes:
+            end_at = end_today + timedelta(days=1)
+        else:
+            end_at = end_today
+        return max(0.0, (end_at - local_now).total_seconds() / 3600.0)
+
+    def _forced_off_window_reserve_soc_percent(self, *, local_now: datetime) -> float:
+        """Extra SOC needed to run the pump through the rest of the forced-off window."""
+        hours = self._hours_until_forced_off_end(local_now=local_now)
+        return (
+            (hours * self._surplus_night_pump_load_kw) / self._battery_capacity_kwh
+        ) * 100.0
+
+    def _forced_off_window_label(self) -> str:
+        return (
+            f"{self._forced_off_start_minutes // 60:02d}:{self._forced_off_start_minutes % 60:02d}"
+            f"–{self._forced_off_end_minutes // 60:02d}:{self._forced_off_end_minutes % 60:02d}"
+        )
+
     def _build_payload(
         self,
         *,
@@ -1143,6 +1228,8 @@ class PumpControlSystem:
             "night_required_soc_percent": decision.night_required_soc_percent,
             "night_reference_sunshine_hours": decision.night_reference_sunshine_hours,
             "night_surplus_mode_active": decision.night_surplus_mode_active,
+            "night_forced_off_window_active": decision.night_forced_off_window_active,
+            "night_forced_off_reserve_soc_percent": decision.night_forced_off_reserve_soc_percent,
             "effective_turn_on_soc_percent": decision.effective_turn_on_soc_percent,
             "effective_turn_off_soc_percent": decision.effective_turn_off_soc_percent,
             "forecast_liberal_factor": decision.forecast_liberal_factor,
@@ -1160,6 +1247,7 @@ class PumpControlSystem:
         return {
             "battery_capacity_kwh": self._battery_capacity_kwh,
             "night_base_load_kw": self._surplus_night_base_load_kw,
+            "night_pump_load_kw": self._surplus_night_pump_load_kw,
             "battery_hard_min_soc_percent": self._battery_hard_min_soc_percent,
         }
 

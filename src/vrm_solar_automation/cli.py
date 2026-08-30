@@ -210,6 +210,11 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
             f"{_format_optional_percent(payload['night_required_soc_percent'])} | "
             f"reference sunshine {_format_optional_hours(payload['night_reference_sunshine_hours'])}"
         )
+        if payload.get("night_forced_off_window_active"):
+            print(
+                "Forced-off window: active | "
+                f"reserve {_format_optional_percent(payload.get('night_forced_off_reserve_soc_percent'))}"
+            )
     return 0
 
 
@@ -255,6 +260,11 @@ async def _run_control(env_file: str, as_json: bool) -> int:
             f"{_format_optional_percent(payload['night_required_soc_percent'])} | "
             f"reference sunshine {_format_optional_hours(payload['night_reference_sunshine_hours'])}"
         )
+        if payload.get("night_forced_off_window_active"):
+            print(
+                "Forced-off window: active | "
+                f"reserve {_format_optional_percent(payload.get('night_forced_off_reserve_soc_percent'))}"
+            )
     print(f"Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"Command sent: {actuation['command_sent']}")
