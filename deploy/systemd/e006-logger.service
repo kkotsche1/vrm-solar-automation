@@ -1,0 +1,16 @@
+[Unit]
+Description=E006 heat-pump diagnostic logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kotschi123
+Group=kotschi123
+WorkingDirectory=/home/kotschi123/vrm-solar-automation
+ExecStart=/home/kotschi123/vrm-solar-automation/venv/bin/python -u /home/kotschi123/vrm-solar-automation/scripts/e006_logger.py --host 192.168.68.77 --shelly 192.168.68.68
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -19,3 +19,5 @@ frontend/.npm-cache/
 *.csx
 
 historicals/
+logs/
+generator_export/
