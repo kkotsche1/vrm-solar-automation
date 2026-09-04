@@ -1185,6 +1185,96 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         # base load: 0.25 h x 1.75 kW over 50 kWh is 0.875%.
         self.assertAlmostEqual(float(at_resume_time["night_required_soc_percent"]), 40.0, places=2)
 
+    async def test_surplus_night_crossover_follows_forecast_sunrise(self) -> None:
+        """Crossover tracks sunrise, so the reserve stays right as the seasons move it."""
+        async def _required(sunrise_iso: str) -> tuple[float, dict]:
+            system = PumpControlSystem(
+                _test_settings(
+                    auto_off_start_local="18:00",
+                    auto_resume_start_local="08:00",
+                    surplus_night_crossover_after_sunrise_minutes=60.0,
+                    surplus_night_enabled=True,
+                ),
+                probe_client=FakeProbeClient(
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0)
+                ),
+                weather_client=FakeWeatherClient(
+                    _build_sunny_weather(
+                        today_sunshine_hours=10.0,
+                        tomorrow_sunshine_hours=10.0,
+                        today_sunrise_iso=sunrise_iso,
+                    )
+                ),
+                state_store=FakeStateStore(),
+                now_provider=_fixed_now(2026, 1, 11, 5, 0),
+            )
+            _, payload = await system.evaluate()
+            return float(payload["night_required_soc_percent"]), payload
+
+        september, september_payload = await _required("2026-09-04T07:19")
+        december, december_payload = await _required("2026-12-21T08:22")
+
+        self.assertEqual(september_payload["night_solar_crossover_local"], "08:19")
+        self.assertEqual(december_payload["night_solar_crossover_local"], "09:22")
+        self.assertEqual(september_payload["night_solar_crossover_source"], "sunrise")
+
+        # The extra 63 min of December darkness is morning base load: 1.05 h x 1.75 kW
+        # over 50 kWh is 3.675%.
+        self.assertAlmostEqual(december - september, 3.675, places=2)
+
+    async def test_surplus_night_uses_tomorrows_sunrise_in_the_evening(self) -> None:
+        """Before midnight the night ends at *tomorrow's* sunrise, not today's."""
+        system = PumpControlSystem(
+            _test_settings(
+                auto_off_start_local="18:00",
+                auto_resume_start_local="08:00",
+                surplus_night_crossover_after_sunrise_minutes=60.0,
+                surplus_night_enabled=True,
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=90.0)
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(
+                    today_sunshine_hours=10.0,
+                    tomorrow_sunshine_hours=10.0,
+                    today_sunrise_iso="2026-01-10T08:00",
+                    tomorrow_sunrise_iso="2026-01-11T07:30",
+                )
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 10, 20, 0),
+        )
+
+        _, payload = await system.evaluate()
+
+        self.assertEqual(payload["night_solar_crossover_local"], "08:30")
+
+    async def test_surplus_night_falls_back_to_fixed_crossover_without_sunrise(self) -> None:
+        """A forecast with no sunrise must not silently shorten the night."""
+        system = PumpControlSystem(
+            _test_settings(
+                auto_off_start_local="18:00",
+                auto_resume_start_local="08:00",
+                surplus_night_solar_crossover_local="08:15",
+                surplus_night_enabled=True,
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0)
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=10.0, tomorrow_sunshine_hours=10.0)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 11, 5, 0),
+        )
+
+        _, payload = await system.evaluate()
+
+        self.assertEqual(payload["night_solar_crossover_local"], "08:15")
+        self.assertEqual(payload["night_solar_crossover_source"], "fallback")
+        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 40.875, places=2)
+
     async def test_surplus_night_uses_hysteresis_to_keep_running_until_off_threshold(self) -> None:
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
@@ -1961,6 +2051,8 @@ def _build_sunny_weather(
     today_sunshine_hours: float = 10.0,
     weather_code: int = 3,
     tomorrow_sunshine_hours: float | None = 10.0,
+    today_sunrise_iso: str | None = None,
+    tomorrow_sunrise_iso: str | None = None,
 ) -> WeatherSnapshot:
     return WeatherSnapshot(
         current_temperature_c=current_temperature_c,
@@ -1970,6 +2062,8 @@ def _build_sunny_weather(
         weather_code=weather_code,
         queried_timezone="Europe/Madrid",
         tomorrow_sunshine_hours=tomorrow_sunshine_hours,
+        today_sunrise_iso=today_sunrise_iso,
+        tomorrow_sunrise_iso=tomorrow_sunrise_iso,
     )
 
 

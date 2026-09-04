@@ -38,6 +38,10 @@ class PumpPolicyState:
     weather_cache_today_max_temperature_c: float | None = None
     weather_cache_today_sunshine_hours: float | None = None
     weather_cache_tomorrow_sunshine_hours: float | None = None
+    weather_cache_today_sunrise_iso: str | None = None
+    weather_cache_tomorrow_sunrise_iso: str | None = None
+    weather_cache_today_sunset_iso: str | None = None
+    weather_cache_tomorrow_sunset_iso: str | None = None
     weather_cache_weather_code: int | None = None
     weather_cache_queried_timezone: str | None = None
     weather_cache_cached_at_iso: str | None = None
@@ -63,6 +67,10 @@ class PumpPolicyState:
             weather_code=self.weather_cache_weather_code,
             queried_timezone=self.weather_cache_queried_timezone,
             tomorrow_sunshine_hours=self.weather_cache_tomorrow_sunshine_hours,
+            today_sunrise_iso=self.weather_cache_today_sunrise_iso,
+            tomorrow_sunrise_iso=self.weather_cache_tomorrow_sunrise_iso,
+            today_sunset_iso=self.weather_cache_today_sunset_iso,
+            tomorrow_sunset_iso=self.weather_cache_tomorrow_sunset_iso,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -83,6 +91,10 @@ class PumpPolicyState:
             "weather_cache_today_max_temperature_c": self.weather_cache_today_max_temperature_c,
             "weather_cache_today_sunshine_hours": self.weather_cache_today_sunshine_hours,
             "weather_cache_tomorrow_sunshine_hours": self.weather_cache_tomorrow_sunshine_hours,
+            "weather_cache_today_sunrise_iso": self.weather_cache_today_sunrise_iso,
+            "weather_cache_tomorrow_sunrise_iso": self.weather_cache_tomorrow_sunrise_iso,
+            "weather_cache_today_sunset_iso": self.weather_cache_today_sunset_iso,
+            "weather_cache_tomorrow_sunset_iso": self.weather_cache_tomorrow_sunset_iso,
             "weather_cache_weather_code": self.weather_cache_weather_code,
             "weather_cache_queried_timezone": self.weather_cache_queried_timezone,
             "weather_cache_cached_at_iso": self.weather_cache_cached_at_iso,
@@ -106,6 +118,8 @@ class PumpDecision:
     night_surplus_mode_active: bool = False
     night_forced_off_window_active: bool = False
     night_pump_reserve_soc_percent: float | None = None
+    night_solar_crossover_local: str | None = None
+    night_solar_crossover_source: str | None = None
     effective_turn_on_soc_percent: float | None = None
     effective_turn_off_soc_percent: float | None = None
     forecast_liberal_factor: float | None = None
@@ -123,6 +137,8 @@ class PumpDecision:
             "night_surplus_mode_active": self.night_surplus_mode_active,
             "night_forced_off_window_active": self.night_forced_off_window_active,
             "night_pump_reserve_soc_percent": self.night_pump_reserve_soc_percent,
+            "night_solar_crossover_local": self.night_solar_crossover_local,
+            "night_solar_crossover_source": self.night_solar_crossover_source,
             "effective_turn_on_soc_percent": self.effective_turn_on_soc_percent,
             "effective_turn_off_soc_percent": self.effective_turn_off_soc_percent,
             "forecast_liberal_factor": self.forecast_liberal_factor,

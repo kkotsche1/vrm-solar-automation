@@ -210,6 +210,11 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
             f"{_format_optional_percent(payload['night_required_soc_percent'])} | "
             f"reference sunshine {_format_optional_hours(payload['night_reference_sunshine_hours'])}"
         )
+        if payload.get("night_solar_crossover_local"):
+            print(
+                f"Solar crossover: {payload['night_solar_crossover_local']} "
+                f"(from {payload.get('night_solar_crossover_source')})"
+            )
         if payload.get("night_forced_off_window_active"):
             print(
                 "Forced-off window: active | "
@@ -260,6 +265,11 @@ async def _run_control(env_file: str, as_json: bool) -> int:
             f"{_format_optional_percent(payload['night_required_soc_percent'])} | "
             f"reference sunshine {_format_optional_hours(payload['night_reference_sunshine_hours'])}"
         )
+        if payload.get("night_solar_crossover_local"):
+            print(
+                f"Solar crossover: {payload['night_solar_crossover_local']} "
+                f"(from {payload.get('night_solar_crossover_source')})"
+            )
         if payload.get("night_forced_off_window_active"):
             print(
                 "Forced-off window: active | "

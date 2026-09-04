@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import sqlite3
 import statistics
 import sys
+import urllib.parse
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -50,9 +53,28 @@ class Night:
     start_soc: float
     today_sunshine: float
     tomorrow_sunshine: float
+    sunrise_iso: str | None
     actual_min_soc: float
     actual_generator_ran: bool
     actual_pump_hours: float
+
+
+def _fetch_sunrise(latitude: float, longitude: float, timezone: str,
+                   past_days: int = 60) -> dict[str, str]:
+    """Sunrise per local date, so the backtest resolves crossover the way production does."""
+    query = urllib.parse.urlencode({
+        "latitude": latitude, "longitude": longitude, "timezone": timezone,
+        "daily": "sunrise", "past_days": min(past_days, 92), "forecast_days": 1,
+    })
+    try:
+        with urllib.request.urlopen(
+            f"https://api.open-meteo.com/v1/forecast?{query}", timeout=20
+        ) as response:
+            daily = json.load(response)["daily"]
+    except Exception as exc:  # noqa: BLE001 - offline is a normal way to run this
+        print(f"(sunrise lookup unavailable, using the fixed fallback crossover: {exc})\n")
+        return {}
+    return dict(zip(daily["time"], daily["sunrise"]))
 
 
 def _load(db: str, tz_offset: int) -> tuple[list[Night], dict[int, float], float]:
@@ -102,6 +124,7 @@ def _load(db: str, tz_offset: int) -> tuple[list[Night], dict[int, float], float
             by_night[(t - timedelta(hours=12)).strftime("%Y-%m-%d")].append((t, r))
 
     nights: list[Night] = []
+    sunrise_by_date = _fetch_sunrise(39.707337, 2.791675, "Europe/Madrid")
     for label in sorted(by_night):
         seg = by_night[label]
         start = next((p for p in seg if p[0].hour == 19), None)
@@ -132,6 +155,10 @@ def _load(db: str, tz_offset: int) -> tuple[list[Night], dict[int, float], float
             actual_min_soc=min(socs),
             actual_generator_ran=any((r["generator_watts"] or 0) > 100 for _, r in window),
             actual_pump_hours=pump_hours,
+            # The night ends at the *next* day's sunrise.
+            sunrise_iso=sunrise_by_date.get(
+                (start[0] + timedelta(days=1)).strftime("%Y-%m-%d")
+            ),
         ))
     return nights, base_by_hour, pump_kw
 
@@ -163,6 +190,16 @@ def _old_thresholds(local_now: datetime, reference_sunshine: float) -> tuple[flo
     return reserve, reserve + margin
 
 
+def _weather_for(night: Night) -> WeatherSnapshot:
+    return WeatherSnapshot(
+        current_temperature_c=None, today_min_temperature_c=None,
+        today_max_temperature_c=None, today_sunshine_hours=night.today_sunshine,
+        weather_code=None, queried_timezone="Europe/Madrid",
+        tomorrow_sunshine_hours=night.tomorrow_sunshine,
+        today_sunrise_iso=night.sunrise_iso, tomorrow_sunrise_iso=night.sunrise_iso,
+    )
+
+
 def _new_thresholds(system: PumpControlSystem, local_now: datetime,
                     soc: float, pump_on: bool, night: Night) -> tuple[float, float]:
     weather = WeatherSnapshot(
@@ -170,6 +207,8 @@ def _new_thresholds(system: PumpControlSystem, local_now: datetime,
         today_max_temperature_c=None, today_sunshine_hours=night.today_sunshine,
         weather_code=None, queried_timezone="Europe/Madrid",
         tomorrow_sunshine_hours=night.tomorrow_sunshine,
+        today_sunrise_iso=night.sunrise_iso,
+        tomorrow_sunrise_iso=night.sunrise_iso,
     )
     power = PowerSnapshot.with_timestamp(
         site_id=1, site_name="backtest", site_identifier="backtest",
@@ -247,7 +286,7 @@ def main() -> int:
     print(f"  generator trip band: {GENERATOR_TRIP_AT_REST:.0f}% at rest, "
           f"{GENERATOR_TRIP_UNDER_LOAD:.0f}% under load\n")
 
-    header = (f"{'night':11} {'crossover':>9} {'SOC@19':>7} | "
+    header = (f"{'night':11} {'sunrise':>8}{'model':>7}{'meas':>6} {'SOC@19':>7} | "
               f"{'OLD min':>8}{'OLD pump':>9}{'OLD gen':>8} | "
               f"{'NEW min':>8}{'NEW pump':>9}{'NEW gen':>8} | {'actual':>19}")
     print(header)
@@ -266,7 +305,14 @@ def main() -> int:
         totals["new_trip"] += int(new[2])
         actual = (f"min {night.actual_min_soc:.0f}% {night.actual_pump_hours:.1f}h "
                   f"{'GEN' if night.actual_generator_ran else '---'}")
-        print(f"{night.label:11} {night.crossover.strftime('%H:%M'):>9} "
+        resolved, source = system._solar_crossover_minutes(
+            weather=_weather_for(night), local_now=night.start
+        )
+        del source
+        print(f"{night.label:11} "
+              f"{(night.sunrise_iso[-5:] if night.sunrise_iso else '-'):>8}"
+              f"{f'{resolved // 60:02d}:{resolved % 60:02d}':>7}"
+              f"{night.crossover.strftime('%H:%M'):>6} "
               f"{night.start_soc:6.0f}% | "
               f"{old[0]:7.1f}%{old[1]:8.1f}h{('GEN' if old[2] else '---'):>8} | "
               f"{new[0]:7.1f}%{new[1]:8.1f}h{('GEN' if new[2] else '---'):>8} | {actual:>19}")

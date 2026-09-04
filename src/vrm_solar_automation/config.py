@@ -41,6 +41,7 @@ class Settings:
     surplus_night_morning_base_load_kw: float = 1.75
     surplus_night_morning_start_local: str = "06:00"
     surplus_night_solar_crossover_local: str = "08:15"
+    surplus_night_crossover_after_sunrise_minutes: float = 60.0
     surplus_night_generator_margin_soc_percent: float = 7.5
     surplus_night_turn_on_margin_soc_percent: float = 10.0
     surplus_night_min_turn_on_margin_soc_percent: float = 7.0
@@ -188,6 +189,10 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         values.get("SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL", "08:15"),
         key="SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL",
     )
+    surplus_night_crossover_after_sunrise_minutes = _parse_non_negative_float(
+        values.get("SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES", "60"),
+        key="SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES",
+    )
     surplus_night_generator_margin_soc_percent = _parse_percent(
         values.get("SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT", "7.5"),
         key="SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT",
@@ -282,6 +287,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         surplus_night_morning_base_load_kw=surplus_night_morning_base_load_kw,
         surplus_night_morning_start_local=surplus_night_morning_start_local,
         surplus_night_solar_crossover_local=surplus_night_solar_crossover_local,
+        surplus_night_crossover_after_sunrise_minutes=surplus_night_crossover_after_sunrise_minutes,
         surplus_night_generator_margin_soc_percent=surplus_night_generator_margin_soc_percent,
         surplus_night_pump_load_kw=surplus_night_pump_load_kw,
         surplus_night_min_run_hours=surplus_night_min_run_hours,

@@ -57,6 +57,10 @@ class StateStore:
                 weather_cache_today_max_temperature_c=row.weather_cache_today_max_temperature_c,
                 weather_cache_today_sunshine_hours=row.weather_cache_today_sunshine_hours,
                 weather_cache_tomorrow_sunshine_hours=row.weather_cache_tomorrow_sunshine_hours,
+                weather_cache_today_sunrise_iso=row.weather_cache_today_sunrise_iso,
+                weather_cache_tomorrow_sunrise_iso=row.weather_cache_tomorrow_sunrise_iso,
+                weather_cache_today_sunset_iso=row.weather_cache_today_sunset_iso,
+                weather_cache_tomorrow_sunset_iso=row.weather_cache_tomorrow_sunset_iso,
                 weather_cache_weather_code=row.weather_cache_weather_code,
                 weather_cache_queried_timezone=row.weather_cache_queried_timezone,
                 weather_cache_cached_at_iso=row.weather_cache_cached_at_iso,
@@ -91,6 +95,10 @@ class StateStore:
                     weather_cache_today_max_temperature_c=state.weather_cache_today_max_temperature_c,
                     weather_cache_today_sunshine_hours=state.weather_cache_today_sunshine_hours,
                     weather_cache_tomorrow_sunshine_hours=state.weather_cache_tomorrow_sunshine_hours,
+                    weather_cache_today_sunrise_iso=state.weather_cache_today_sunrise_iso,
+                    weather_cache_tomorrow_sunrise_iso=state.weather_cache_tomorrow_sunrise_iso,
+                    weather_cache_today_sunset_iso=state.weather_cache_today_sunset_iso,
+                    weather_cache_tomorrow_sunset_iso=state.weather_cache_tomorrow_sunset_iso,
                     weather_cache_weather_code=state.weather_cache_weather_code,
                     weather_cache_queried_timezone=state.weather_cache_queried_timezone,
                     weather_cache_cached_at_iso=state.weather_cache_cached_at_iso,
@@ -128,6 +136,10 @@ class StateStore:
                 row.weather_cache_tomorrow_sunshine_hours = (
                     state.weather_cache_tomorrow_sunshine_hours
                 )
+                row.weather_cache_today_sunrise_iso = state.weather_cache_today_sunrise_iso
+                row.weather_cache_tomorrow_sunrise_iso = state.weather_cache_tomorrow_sunrise_iso
+                row.weather_cache_today_sunset_iso = state.weather_cache_today_sunset_iso
+                row.weather_cache_tomorrow_sunset_iso = state.weather_cache_tomorrow_sunset_iso
                 row.weather_cache_weather_code = state.weather_cache_weather_code
                 row.weather_cache_queried_timezone = state.weather_cache_queried_timezone
                 row.weather_cache_cached_at_iso = state.weather_cache_cached_at_iso
@@ -194,6 +206,8 @@ class StateStore:
                     decision_weather_mode=decision.weather_mode,
                     soc_control_mode=decision.soc_control_mode,
                     night_required_soc_percent=decision.night_required_soc_percent,
+                    night_solar_crossover_local=decision.night_solar_crossover_local,
+                    night_solar_crossover_source=decision.night_solar_crossover_source,
                     night_surplus_mode_active=decision.night_surplus_mode_active,
                     effective_turn_on_soc_percent=decision.effective_turn_on_soc_percent,
                     effective_turn_off_soc_percent=decision.effective_turn_off_soc_percent,
