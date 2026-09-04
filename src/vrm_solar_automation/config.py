@@ -34,6 +34,7 @@ class Settings:
     auto_off_start_local: str = "18:00"
     auto_resume_start_local: str = "08:00"
     auto_control_timezone: str = "Europe/Madrid"
+    auto_resume_follows_crossover: bool = True
     forecast_liberal_sunshine_hours_min: float = 9.0
     forecast_liberal_sunshine_hours_max: float = 12.0
     surplus_night_enabled: bool = True
@@ -272,6 +273,9 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         auto_control_timezone=auto_control_timezone,
         forecast_liberal_sunshine_hours_min=forecast_liberal_sunshine_hours_min,
         forecast_liberal_sunshine_hours_max=forecast_liberal_sunshine_hours_max,
+        auto_resume_follows_crossover=values.get(
+            "AUTO_RESUME_FOLLOWS_CROSSOVER", "true"
+        ).lower() in {"1", "true", "yes", "on"},
         surplus_night_enabled=values.get("SURPLUS_NIGHT_ENABLED", "true").lower() in {
             "1",
             "true",

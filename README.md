@@ -70,6 +70,7 @@ BATTERY_ALERT_REARM_MARGIN_PERCENT=5
 AUTO_OFF_START_LOCAL=18:00
 AUTO_RESUME_START_LOCAL=08:00
 AUTO_CONTROL_TIMEZONE=Europe/Madrid
+AUTO_RESUME_FOLLOWS_CROSSOVER=true
 FORECAST_LIBERAL_SUNSHINE_HOURS_MIN=9.0
 FORECAST_LIBERAL_SUNSHINE_HOURS_MAX=12.0
 SURPLUS_NIGHT_ENABLED=true
@@ -119,6 +120,8 @@ The daytime SOC settings are now forecast-adaptive instead of using a single fix
 There are exactly two control modes and no time-of-day bias within either one: the daytime adaptive policy, and reserve-aware night control. Daytime SOC thresholds depend only on the forecast, never on the clock.
 
 `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` define the overnight control window in `AUTO_CONTROL_TIMEZONE`. With `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware overnight automation instead of a hard forced-`OFF` quiet-hours block.
+
+With `AUTO_RESUME_FOLLOWS_CROSSOVER=true` (the default) night control holds until the derived solar crossover instead of `AUTO_RESUME_START_LOCAL`, which then serves only as the fallback for when no sunrise is available. This matters because the two are not the same moment: resuming at a fixed time hands the last stretch of darkness to the daytime thresholds, whose turn-on can start the pump on charge the night reserve had earmarked for reaching crossover. Set it to `false` to restore the fixed-time boundary.
 Seasonal `SUMMER_*` / `WINTER_*` quiet-hours keys are not supported.
 
 The surplus-night settings keep the logic simple and deterministic:

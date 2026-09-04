@@ -133,6 +133,7 @@ class PumpControlSystem:
         self._auto_off_start_minutes = _hhmm_to_minutes(settings.auto_off_start_local)
         self._auto_resume_start_minutes = _hhmm_to_minutes(settings.auto_resume_start_local)
         self._auto_control_timezone = ZoneInfo(settings.auto_control_timezone)
+        self._auto_resume_follows_crossover = settings.auto_resume_follows_crossover
         self._weather_timezone = ZoneInfo(settings.weather_timezone)
         self._surplus_night_enabled = settings.surplus_night_enabled
         self._surplus_night_base_load_kw = settings.surplus_night_base_load_kw
@@ -333,6 +334,7 @@ class PumpControlSystem:
         return self._evaluate_unavailable_power(
             previous_state=previous_state,
             power_status=power_status,
+            weather=weather,
         )
 
     def _evaluate_policy_with_inputs(
@@ -355,7 +357,7 @@ class PumpControlSystem:
             weather=weather,
             previous_state=previous_state,
         )
-        if self._is_within_quiet_hours(local_now=local_now):
+        if self._is_within_quiet_hours(local_now=local_now, weather=weather):
             if self._surplus_night_enabled:
                 decision = self._decide_surplus_night(
                     power=power,
@@ -412,6 +414,7 @@ class PumpControlSystem:
         *,
         previous_state: PumpPolicyState | None,
         power_status: TelemetryStatus,
+        weather: WeatherSnapshot | None = None,
     ) -> tuple[
         PumpDecision,
         PumpPolicyState | None,
@@ -420,7 +423,8 @@ class PumpControlSystem:
     ]:
         local_now = self._local_now()
         quiet_hours_forced_off = (
-            self._is_within_quiet_hours(local_now=local_now) and not self._surplus_night_enabled
+            self._is_within_quiet_hours(local_now=local_now, weather=weather)
+            and not self._surplus_night_enabled
         )
         next_failure_count = (previous_state.consecutive_power_failures if previous_state else 0) + 1
         previous_target_is_on = previous_state.is_on if previous_state is not None else False
@@ -1270,7 +1274,7 @@ class PumpControlSystem:
     def _next_crossover_at(
         self, *, local_now: datetime, weather: WeatherSnapshot | None = None
     ) -> datetime | None:
-        if not self._is_within_quiet_hours(local_now=local_now):
+        if not self._is_within_quiet_hours(local_now=local_now, weather=weather):
             return None
         minutes, _ = self._solar_crossover_minutes(weather=weather, local_now=local_now)
         return _next_local_time(local_now, minutes)
@@ -1357,10 +1361,31 @@ class PumpControlSystem:
             return False
         return automatic_target_is_on
 
-    def _is_within_quiet_hours(self, *, local_now: datetime | None = None) -> bool:
+    def _resume_minutes(
+        self, *, weather: WeatherSnapshot | None, local_now: datetime
+    ) -> int:
+        """When daytime control takes back over, in minutes past local midnight.
+
+        Night control has to hold until solar actually carries the house, not until a fixed
+        clock time: resuming at `AUTO_RESUME_START_LOCAL` handed the last stretch of darkness
+        to the daytime thresholds, which could clear the pump to start on a battery whose
+        remaining charge was reserved to reach crossover. Falls back to the configured time
+        when the crossover cannot be derived from a sunrise.
+        """
+        if not self._auto_resume_follows_crossover:
+            return self._auto_resume_start_minutes
+        minutes, source = self._solar_crossover_minutes(weather=weather, local_now=local_now)
+        return minutes if source == "sunrise" else self._auto_resume_start_minutes
+
+    def _is_within_quiet_hours(
+        self,
+        *,
+        local_now: datetime | None = None,
+        weather: WeatherSnapshot | None = None,
+    ) -> bool:
         candidate = local_now or self._local_now()
         off_start = self._auto_off_start_minutes
-        resume_start = self._auto_resume_start_minutes
+        resume_start = self._resume_minutes(weather=weather, local_now=candidate)
         if off_start == resume_start:
             return False
 

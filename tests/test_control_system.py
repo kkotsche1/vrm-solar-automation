@@ -1275,6 +1275,77 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["night_solar_crossover_source"], "fallback")
         self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 40.875, places=2)
 
+    async def test_night_control_holds_until_solar_crossover_not_resume_time(self) -> None:
+        """The last stretch of darkness belongs to night control, not the daytime thresholds.
+
+        Resuming at AUTO_RESUME_START_LOCAL handed 07:00-crossover to the daytime policy,
+        whose 40% turn-on could start the pump on charge the night reserve had earmarked for
+        reaching crossover. At 07:30 with sunrise at 07:19 the sun is up but not yet carrying
+        the house, so night control must still be in charge.
+        """
+        def _system(*, follows_crossover: bool) -> PumpControlSystem:
+            return PumpControlSystem(
+                _test_settings(
+                    auto_off_start_local="18:00",
+                    auto_resume_start_local="07:00",
+                    auto_resume_follows_crossover=follows_crossover,
+                    surplus_night_crossover_after_sunrise_minutes=60.0,
+                    surplus_night_enabled=True,
+                ),
+                probe_client=FakeProbeClient(
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=42.0)
+                ),
+                weather_client=FakeWeatherClient(
+                    _build_sunny_weather(
+                        today_sunshine_hours=12.0,
+                        tomorrow_sunshine_hours=12.0,
+                        today_sunrise_iso="2026-01-11T07:19",
+                    )
+                ),
+                state_store=FakeStateStore(),
+                now_provider=_fixed_now(2026, 1, 11, 7, 0),
+            )
+
+        night, night_payload = await _system(follows_crossover=True).evaluate()
+        daytime, daytime_payload = await _system(follows_crossover=False).evaluate()
+
+        # 42% clears the daytime 40% turn-on but not night control's 45.8%, which still has
+        # to cover base load and the committed compressor run through to 08:19.
+        self.assertEqual(night_payload["soc_control_mode"], "surplus_night")
+        self.assertFalse(night.should_turn_on)
+        self.assertEqual(night_payload["night_solar_crossover_local"], "08:19")
+
+        self.assertEqual(daytime_payload["soc_control_mode"], "daytime_adaptive")
+        self.assertTrue(daytime.should_turn_on)
+
+    async def test_night_control_hands_over_once_solar_carries_the_house(self) -> None:
+        """Past crossover the daytime policy takes back over."""
+        system = PumpControlSystem(
+            _test_settings(
+                auto_off_start_local="18:00",
+                auto_resume_start_local="07:00",
+                surplus_night_crossover_after_sunrise_minutes=60.0,
+                surplus_night_enabled=True,
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=42.0)
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(
+                    today_sunshine_hours=12.0,
+                    tomorrow_sunshine_hours=12.0,
+                    today_sunrise_iso="2026-01-11T07:19",
+                )
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 11, 8, 30),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertEqual(payload["soc_control_mode"], "daytime_adaptive")
+        self.assertTrue(decision.should_turn_on)
+
     async def test_surplus_night_uses_hysteresis_to_keep_running_until_off_threshold(self) -> None:
         state_store = FakeStateStore()
         state_store.state = PumpPolicyState(
