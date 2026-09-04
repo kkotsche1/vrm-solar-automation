@@ -136,6 +136,14 @@ class PumpControlSystem:
         self._weather_timezone = ZoneInfo(settings.weather_timezone)
         self._surplus_night_enabled = settings.surplus_night_enabled
         self._surplus_night_base_load_kw = settings.surplus_night_base_load_kw
+        self._surplus_night_morning_base_load_kw = settings.surplus_night_morning_base_load_kw
+        self._morning_start_minutes = _hhmm_to_minutes(settings.surplus_night_morning_start_local)
+        self._solar_crossover_minutes = _hhmm_to_minutes(
+            settings.surplus_night_solar_crossover_local
+        )
+        self._surplus_night_generator_margin_soc_percent = (
+            settings.surplus_night_generator_margin_soc_percent
+        )
         self._surplus_night_turn_on_margin_soc_percent = (
             settings.surplus_night_turn_on_margin_soc_percent
         )
@@ -144,6 +152,7 @@ class PumpControlSystem:
         )
         self._surplus_night_next_day_sunshine_min = settings.surplus_night_next_day_sunshine_min
         self._surplus_night_pump_load_kw = settings.surplus_night_pump_load_kw
+        self._surplus_night_min_run_hours = settings.surplus_night_min_run_hours
         self._forced_off_start_minutes = _hhmm_to_minutes(settings.surplus_night_forced_off_start_local)
         self._forced_off_end_minutes = _hhmm_to_minutes(settings.surplus_night_forced_off_end_local)
         self._battery_capacity_kwh = settings.battery_capacity_kwh
@@ -930,9 +939,7 @@ class PumpControlSystem:
         battery_soc = power.battery_soc_percent
         required_soc = self._required_night_soc_percent(local_now=local_now)
         forced_off_active = self._is_within_forced_off_window(local_now=local_now)
-        forced_off_reserve = self._forced_off_window_reserve_soc_percent(local_now=local_now)
-        forced_off_reserve_soc_percent = forced_off_reserve if forced_off_active else None
-        reserve_soc = required_soc + forced_off_reserve
+        pump_reserve = self._pump_start_reserve_soc_percent(local_now=local_now)
         reference_label, reference_sunshine = self._night_reference_sunshine(
             weather=weather,
             local_now=local_now,
@@ -946,15 +953,20 @@ class PumpControlSystem:
         turn_on_threshold = None
         turn_off_threshold = None
         if liberal_factor is not None:
-            # Cut off exactly at the reserve so the battery lands on the hard floor at resume
-            # time; the turn-on margin is pure hysteresis and does not raise the landing point.
-            # Inside the forced-off window the reserve also covers the pump draw for the rest of
-            # the window, so the pump only runs there when there is genuine excess SOC.
-            turn_off_threshold = reserve_soc
-            turn_on_threshold = reserve_soc + linear_interpolate(
-                self._surplus_night_turn_on_margin_soc_percent,
-                self._surplus_night_min_turn_on_margin_soc_percent,
-                liberal_factor,
+            # Cut off exactly at the base-load reserve so the battery lands on the night floor
+            # at solar crossover; because that reserve no longer decays toward the floor as
+            # dawn approaches, the pump can no longer be run down into the morning. Starting
+            # additionally carries the compressor run it commits to, so a start is dearer than
+            # continuing rather than the other way round.
+            turn_off_threshold = required_soc
+            turn_on_threshold = (
+                required_soc
+                + pump_reserve
+                + linear_interpolate(
+                    self._surplus_night_turn_on_margin_soc_percent,
+                    self._surplus_night_min_turn_on_margin_soc_percent,
+                    liberal_factor,
+                )
             )
         blocked_subject = (
             f"The {self._forced_off_window_label()} forced-off window"
@@ -967,9 +979,7 @@ class PumpControlSystem:
             else ""
         )
         reserve_clause = (
-            f" (including {forced_off_reserve:.1f}% to run the pump through the rest of the window)"
-            if forced_off_active
-            else ""
+            f" (including {pump_reserve:.1f}% for the compressor run a start commits to)"
         )
 
         if battery_soc is None:
@@ -982,7 +992,7 @@ class PumpControlSystem:
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
                 forced_off_window_active=forced_off_active,
-                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+                pump_reserve_soc_percent=pump_reserve,
                 reason="Battery SOC is unavailable, so reserve-aware night control fails safe to off.",
             )
 
@@ -996,7 +1006,7 @@ class PumpControlSystem:
                 effective_turn_off_soc_percent=None,
                 forecast_liberal_factor=None,
                 forced_off_window_active=forced_off_active,
-                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+                pump_reserve_soc_percent=pump_reserve,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine-hours forecast is unavailable, so "
                     "reserve-aware night control keeps the pump off."
@@ -1013,7 +1023,7 @@ class PumpControlSystem:
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
                 forced_off_window_active=forced_off_active,
-                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+                pump_reserve_soc_percent=pump_reserve,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine forecast is {reference_sunshine:.1f} hours, "
                     f"below the {self._surplus_night_next_day_sunshine_min:.1f}-hour surplus-night minimum, "
@@ -1032,11 +1042,10 @@ class PumpControlSystem:
                     effective_turn_off_soc_percent=turn_off_threshold,
                     forecast_liberal_factor=liberal_factor,
                     forced_off_window_active=forced_off_active,
-                    forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+                    pump_reserve_soc_percent=pump_reserve,
                     reason=(
                         f"{blocked_subject} needs at least {turn_off_threshold:.1f}% SOC to keep "
-                        f"running{reserve_clause}, and battery SOC is {battery_soc:.1f}%, so the pump "
-                        "turns off."
+                        f"running, and battery SOC is {battery_soc:.1f}%, so the pump turns off."
                     ),
                 )
             return self._night_decision(
@@ -1048,12 +1057,12 @@ class PumpControlSystem:
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
                 forced_off_window_active=forced_off_active,
-                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+                pump_reserve_soc_percent=pump_reserve,
                 reason=(
                     f"Reserve-aware night control stays on{mode_phrase} because {reference_label}'s "
                     f"sunshine forecast is {reference_sunshine:.1f} hours and battery SOC is "
                     f"{battery_soc:.1f}%, above the {turn_off_threshold:.1f}% keep-running "
-                    f"threshold{reserve_clause}."
+                    "threshold."
                 ),
             )
 
@@ -1067,7 +1076,7 @@ class PumpControlSystem:
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
                 forced_off_window_active=forced_off_active,
-                forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+                pump_reserve_soc_percent=pump_reserve,
                 reason=(
                     f"{blocked_subject} needs at least {turn_on_threshold:.1f}% SOC to turn on"
                     f"{reserve_clause}, and battery SOC is {battery_soc:.1f}%, so the pump stays off."
@@ -1083,7 +1092,7 @@ class PumpControlSystem:
             effective_turn_off_soc_percent=turn_off_threshold,
             forecast_liberal_factor=liberal_factor,
             forced_off_window_active=forced_off_active,
-            forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+            pump_reserve_soc_percent=pump_reserve,
             reason=(
                 f"Reserve-aware night control can run{mode_phrase} because {reference_label}'s sunshine "
                 f"forecast is {reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, "
@@ -1103,7 +1112,7 @@ class PumpControlSystem:
         forecast_liberal_factor: float | None,
         reason: str,
         forced_off_window_active: bool = False,
-        forced_off_reserve_soc_percent: float | None = None,
+        pump_reserve_soc_percent: float | None = None,
     ) -> PumpDecision:
         return PumpDecision(
             should_turn_on=target_on,
@@ -1116,7 +1125,7 @@ class PumpControlSystem:
             night_reference_sunshine_hours=reference_sunshine,
             night_surplus_mode_active=True,
             night_forced_off_window_active=forced_off_window_active,
-            night_forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
+            night_pump_reserve_soc_percent=pump_reserve_soc_percent,
             effective_turn_on_soc_percent=effective_turn_on_soc_percent,
             effective_turn_off_soc_percent=effective_turn_off_soc_percent,
             forecast_liberal_factor=forecast_liberal_factor,
@@ -1133,32 +1142,79 @@ class PumpControlSystem:
             return "tomorrow", weather.tomorrow_sunshine_hours
         return "today", weather.today_sunshine_hours
 
-    def _required_night_soc_percent(self, *, local_now: datetime) -> float:
-        """SOC needed right now for base load alone to land on the hard floor at resume time."""
-        hours_until_resume = self._hours_until_resume(local_now=local_now)
+    def _night_floor_soc_percent(self) -> float:
+        """The SOC the battery should still hold when solar takes over.
+
+        The generator auto-starts on sagging DC voltage, so its effective trip point rises
+        with load — observed between 20% at rest and 28% under a running compressor. The
+        margin keeps the planned landing point clear of that band.
+        """
         return (
             self._battery_hard_min_soc_percent
-            + ((hours_until_resume * self._surplus_night_base_load_kw) / self._battery_capacity_kwh)
+            + self._surplus_night_generator_margin_soc_percent
+        )
+
+    def _required_night_soc_percent(self, *, local_now: datetime) -> float:
+        """SOC needed now for base load alone to land on the night floor at solar crossover.
+
+        Measured against `AUTO_RESUME_START_LOCAL` this used to fall ~1.25 h short: the
+        controller resumes daytime control before solar actually carries the house, and the
+        uncovered stretch sits on the night's heaviest base load.
+        """
+        return (
+            self._night_floor_soc_percent()
+            + (
+                self._base_load_kwh_until_crossover(local_now=local_now)
+                / self._battery_capacity_kwh
+            )
             * 100.0
         )
 
-    def _hours_until_resume(self, *, local_now: datetime) -> float:
-        resume_today = local_now.replace(
-            hour=self._auto_resume_start_minutes // 60,
-            minute=self._auto_resume_start_minutes % 60,
-            second=0,
-            microsecond=0,
-        )
-        if not self._is_within_quiet_hours(local_now=local_now):
+    def _base_load_kwh_until_crossover(self, *, local_now: datetime) -> float:
+        """Integrate the two-segment base-load profile from now to solar crossover.
+
+        Base load is not flat overnight: it sits near `SURPLUS_NIGHT_BASE_LOAD_KW` through
+        the small hours and steps up to `SURPLUS_NIGHT_MORNING_BASE_LOAD_KW` once the house
+        wakes, which is precisely the stretch a resume-time budget omits.
+        """
+        crossover_at = self._next_crossover_at(local_now=local_now)
+        if crossover_at is None:
             return 0.0
-        current_minutes = (local_now.hour * 60) + local_now.minute
-        if self._auto_off_start_minutes < self._auto_resume_start_minutes:
-            resume_at = resume_today
-        elif current_minutes >= self._auto_off_start_minutes:
-            resume_at = resume_today + timedelta(days=1)
-        else:
-            resume_at = resume_today
-        return max(0.0, (resume_at - local_now).total_seconds() / 3600.0)
+        morning_at = _previous_local_time(crossover_at, self._morning_start_minutes)
+        if morning_at > crossover_at:
+            morning_at = crossover_at
+        if local_now >= morning_at:
+            return _hours_between(local_now, crossover_at) * self._surplus_night_morning_base_load_kw
+        return (
+            _hours_between(local_now, morning_at) * self._surplus_night_base_load_kw
+            + _hours_between(morning_at, crossover_at) * self._surplus_night_morning_base_load_kw
+        )
+
+    def _pump_start_reserve_soc_percent(self, *, local_now: datetime) -> float:
+        """SOC a *start* must cover on top of the base-load reserve.
+
+        Switching the plug triggers a compressor that cannot be cancelled once it fires, so a
+        start commits roughly `SURPLUS_NIGHT_MIN_RUN_HOURS` of draw whatever the SOC does next.
+        Charging that to the turn-on threshold — and never to the keep-running threshold —
+        makes starting dearer than continuing, so the pump is not cleared to fire shortly
+        before dawn. Capped at the time actually left, so it cannot overstate the commitment.
+        """
+        hours = min(
+            self._surplus_night_min_run_hours,
+            self._hours_until_crossover(local_now=local_now),
+        )
+        return ((hours * self._surplus_night_pump_load_kw) / self._battery_capacity_kwh) * 100.0
+
+    def _hours_until_crossover(self, *, local_now: datetime) -> float:
+        crossover_at = self._next_crossover_at(local_now=local_now)
+        if crossover_at is None:
+            return 0.0
+        return _hours_between(local_now, crossover_at)
+
+    def _next_crossover_at(self, *, local_now: datetime) -> datetime | None:
+        if not self._is_within_quiet_hours(local_now=local_now):
+            return None
+        return _next_local_time(local_now, self._solar_crossover_minutes)
 
     def _is_within_forced_off_window(self, *, local_now: datetime) -> bool:
         start = self._forced_off_start_minutes
@@ -1169,31 +1225,6 @@ class PumpControlSystem:
         if start < end:
             return start <= current_minutes < end
         return current_minutes >= start or current_minutes < end
-
-    def _hours_until_forced_off_end(self, *, local_now: datetime) -> float:
-        if not self._is_within_forced_off_window(local_now=local_now):
-            return 0.0
-        end_today = local_now.replace(
-            hour=self._forced_off_end_minutes // 60,
-            minute=self._forced_off_end_minutes % 60,
-            second=0,
-            microsecond=0,
-        )
-        current_minutes = (local_now.hour * 60) + local_now.minute
-        if self._forced_off_start_minutes < self._forced_off_end_minutes:
-            end_at = end_today
-        elif current_minutes >= self._forced_off_start_minutes:
-            end_at = end_today + timedelta(days=1)
-        else:
-            end_at = end_today
-        return max(0.0, (end_at - local_now).total_seconds() / 3600.0)
-
-    def _forced_off_window_reserve_soc_percent(self, *, local_now: datetime) -> float:
-        """Extra SOC needed to run the pump through the rest of the forced-off window."""
-        hours = self._hours_until_forced_off_end(local_now=local_now)
-        return (
-            (hours * self._surplus_night_pump_load_kw) / self._battery_capacity_kwh
-        ) * 100.0
 
     def _forced_off_window_label(self) -> str:
         return (
@@ -1229,7 +1260,7 @@ class PumpControlSystem:
             "night_reference_sunshine_hours": decision.night_reference_sunshine_hours,
             "night_surplus_mode_active": decision.night_surplus_mode_active,
             "night_forced_off_window_active": decision.night_forced_off_window_active,
-            "night_forced_off_reserve_soc_percent": decision.night_forced_off_reserve_soc_percent,
+            "night_pump_reserve_soc_percent": decision.night_pump_reserve_soc_percent,
             "effective_turn_on_soc_percent": decision.effective_turn_on_soc_percent,
             "effective_turn_off_soc_percent": decision.effective_turn_off_soc_percent,
             "forecast_liberal_factor": decision.forecast_liberal_factor,
@@ -1327,3 +1358,29 @@ def _hhmm_to_minutes(value: str | None) -> int:
         return 0
     hour_raw, minute_raw = value.split(":", 1)
     return int(hour_raw) * 60 + int(minute_raw)
+
+
+def _at_minutes(moment: datetime, minutes: int) -> datetime:
+    return moment.replace(
+        hour=minutes // 60, minute=minutes % 60, second=0, microsecond=0
+    )
+
+
+def _next_local_time(moment: datetime, minutes: int) -> datetime:
+    """The first occurrence of a wall-clock time at or after `moment`."""
+    candidate = _at_minutes(moment, minutes)
+    if candidate < moment:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _previous_local_time(moment: datetime, minutes: int) -> datetime:
+    """The last occurrence of a wall-clock time at or before `moment`."""
+    candidate = _at_minutes(moment, minutes)
+    if candidate > moment:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _hours_between(start: datetime, end: datetime) -> float:
+    return max(0.0, (end - start).total_seconds() / 3600.0)

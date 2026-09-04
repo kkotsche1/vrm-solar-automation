@@ -911,7 +911,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["intended_target_is_on"])
         self.assertFalse(payload["quiet_hours_blocked"])
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 61.5, places=1)
+        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 70.9, places=1)
         self.assertAlmostEqual(float(payload["night_reference_sunshine_hours"]), 10.0, places=1)
 
     async def test_surplus_night_stays_off_when_tomorrow_is_not_sunny_enough(self) -> None:
@@ -960,7 +960,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.should_turn_on)
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertFalse(payload["intended_target_is_on"])
-        self.assertIn("needs at least 70.5% SOC to turn on", decision.reason)
+        self.assertIn("needs at least 84.1% SOC to turn on", decision.reason)
 
     async def test_surplus_night_forced_off_window_blocks_pump_without_excess_soc(self) -> None:
         system = PumpControlSystem(
@@ -985,9 +985,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertTrue(payload["night_forced_off_window_active"])
         self.assertFalse(payload["intended_target_is_on"])
-        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 40.5, places=1)
-        self.assertAlmostEqual(float(payload["night_forced_off_reserve_soc_percent"]), 13.5, places=1)
-        self.assertIn("forced-off window needs at least 63.0% SOC to turn on", decision.reason)
+        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 49.9, places=1)
+        self.assertAlmostEqual(float(payload["night_pump_reserve_soc_percent"]), 4.2, places=1)
+        self.assertIn("forced-off window needs at least 63.1% SOC to turn on", decision.reason)
 
     async def test_surplus_night_forced_off_window_allows_pump_with_excess_soc(self) -> None:
         system = PumpControlSystem(
@@ -1013,7 +1013,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["night_forced_off_window_active"])
         self.assertTrue(payload["intended_target_is_on"])
         self.assertIn("forced-off window", decision.reason)
-        self.assertIn("meeting the 63.0% turn-on threshold", decision.reason)
+        self.assertIn("meeting the 63.1% turn-on threshold", decision.reason)
 
     async def test_surplus_night_runs_normally_before_midnight(self) -> None:
         system = PumpControlSystem(
@@ -1037,8 +1037,8 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.should_turn_on)
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertFalse(payload["night_forced_off_window_active"])
-        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 49.5, places=1)
-        self.assertIsNone(payload["night_forced_off_reserve_soc_percent"])
+        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 58.9, places=1)
+        self.assertAlmostEqual(float(payload["night_pump_reserve_soc_percent"]), 4.2, places=1)
 
     async def test_surplus_night_forced_off_window_starts_at_11_30pm(self) -> None:
         system = PumpControlSystem(
@@ -1061,7 +1061,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(decision.should_turn_on)
         self.assertTrue(payload["night_forced_off_window_active"])
-        self.assertAlmostEqual(float(payload["night_forced_off_reserve_soc_percent"]), 33.75, places=2)
+        self.assertAlmostEqual(float(payload["night_pump_reserve_soc_percent"]), 4.2, places=1)
         self.assertIn("forced-off window", decision.reason)
 
     async def test_surplus_night_resumes_normally_after_forced_off_window(self) -> None:
@@ -1086,8 +1086,104 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.should_turn_on)
         self.assertTrue(payload["night_surplus_mode_active"])
         self.assertFalse(payload["night_forced_off_window_active"])
-        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 31.5, places=1)
-        self.assertIsNone(payload["night_forced_off_reserve_soc_percent"])
+        self.assertAlmostEqual(float(payload["night_required_soc_percent"]), 40.9, places=1)
+        self.assertAlmostEqual(float(payload["night_pump_reserve_soc_percent"]), 4.2, places=1)
+
+    async def test_surplus_night_reserve_does_not_decay_toward_the_floor_before_dawn(self) -> None:
+        """The pre-dawn hours must be the least permissive part of the night, not the most.
+
+        The retired formula counted down to AUTO_RESUME_START_LOCAL, so its requirement fell
+        to the floor as dawn approached and cleared the pump to start at 03:30 and run into
+        the morning. Anchoring on solar crossover keeps a real morning budget in reserve.
+        """
+        requirements = []
+        for hour in (23, 1, 3, 5):
+            system = PumpControlSystem(
+                _test_settings(
+                    auto_off_start_local="18:00",
+                    auto_resume_start_local="08:00",
+                    surplus_night_enabled=True,
+                ),
+                probe_client=FakeProbeClient(
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0)
+                ),
+                weather_client=FakeWeatherClient(
+                    _build_sunny_weather(today_sunshine_hours=10.0, tomorrow_sunshine_hours=10.0)
+                ),
+                state_store=FakeStateStore(),
+                now_provider=_fixed_now(2026, 1, 11, hour, 0),
+            )
+            _, payload = await system.evaluate()
+            requirements.append(float(payload["night_required_soc_percent"]))
+
+        # Still falls as the night is used up, but never below the morning budget: from 06:00
+        # to the 08:15 crossover the house draws 1.75 kW, which is 7.9% of a 50 kWh battery.
+        self.assertEqual(requirements, sorted(requirements, reverse=True))
+        self.assertGreater(requirements[-1], 40.0)
+        self.assertAlmostEqual(requirements[-1], 40.875, places=2)
+
+    async def test_surplus_night_start_is_dearer_than_continuing(self) -> None:
+        """Starting carries the compressor run it commits to; continuing does not."""
+        settings = _test_settings(
+            auto_off_start_local="18:00",
+            auto_resume_start_local="08:00",
+            surplus_night_enabled=True,
+        )
+        weather = _build_sunny_weather(today_sunshine_hours=10.0, tomorrow_sunshine_hours=10.0)
+
+        def _system(previous_is_on: bool) -> PumpControlSystem:
+            state_store = FakeStateStore()
+            if previous_is_on:
+                state_store.state = PumpPolicyState(
+                    is_on=True,
+                    changed_at_iso=datetime(2026, 1, 10, 20, 0, tzinfo=UTC).isoformat(),
+                )
+            return PumpControlSystem(
+                settings,
+                probe_client=FakeProbeClient(
+                    _build_power_snapshot(generator_watts=0.0, battery_soc_percent=52.0)
+                ),
+                weather_client=FakeWeatherClient(weather),
+                state_store=state_store,
+                now_provider=_fixed_now(2026, 1, 11, 5, 0),
+            )
+
+        running, running_payload = await _system(True).evaluate()
+        stopped, stopped_payload = await _system(False).evaluate()
+
+        # 52% clears the 40.9% keep-running threshold but not the 54.1% turn-on threshold.
+        self.assertTrue(running.should_turn_on)
+        self.assertFalse(stopped.should_turn_on)
+        self.assertGreater(
+            float(stopped_payload["effective_turn_on_soc_percent"]),
+            float(running_payload["effective_turn_off_soc_percent"]),
+        )
+        self.assertAlmostEqual(float(stopped_payload["night_pump_reserve_soc_percent"]), 4.2, places=1)
+
+    async def test_surplus_night_reserve_covers_the_gap_to_solar_crossover(self) -> None:
+        """The budget must run to measured crossover, not to the daytime-control resume time."""
+        system = PumpControlSystem(
+            _test_settings(
+                auto_off_start_local="18:00",
+                auto_resume_start_local="08:00",
+                surplus_night_solar_crossover_local="08:00",
+                surplus_night_enabled=True,
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=60.0)
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=10.0, tomorrow_sunshine_hours=10.0)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 1, 11, 5, 0),
+        )
+
+        _, at_resume_time = await system.evaluate()
+
+        # Pulling crossover back to the 08:00 resume time drops a quarter hour of morning
+        # base load: 0.25 h x 1.75 kW over 50 kWh is 0.875%.
+        self.assertAlmostEqual(float(at_resume_time["night_required_soc_percent"]), 40.0, places=2)
 
     async def test_surplus_night_uses_hysteresis_to_keep_running_until_off_threshold(self) -> None:
         state_store = FakeStateStore()
@@ -1116,7 +1212,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.should_turn_on)
         self.assertEqual(decision.action, "keep_on")
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertIn("above the 61.5% keep-running threshold", decision.reason)
+        self.assertIn("above the 70.9% keep-running threshold", decision.reason)
 
     async def test_surplus_night_turns_off_when_soc_reaches_off_threshold(self) -> None:
         state_store = FakeStateStore()
@@ -1145,7 +1241,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.should_turn_on)
         self.assertEqual(decision.action, "turn_off")
         self.assertTrue(payload["night_surplus_mode_active"])
-        self.assertIn("needs at least 61.5% SOC to keep running", decision.reason)
+        self.assertIn("needs at least 70.9% SOC to keep running", decision.reason)
 
     async def test_surplus_night_ignores_generator_power(self) -> None:
         system = PumpControlSystem(
@@ -1191,7 +1287,7 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
             {
                 "battery_capacity_kwh": 50.0,
                 "night_base_load_kw": 1.5,
-                "night_pump_load_kw": 4.5,
+                "night_pump_load_kw": 2.1,
                 "battery_hard_min_soc_percent": 22.5,
             },
         )
@@ -1814,6 +1910,12 @@ def _test_settings(**overrides) -> Settings:
         "forecast_liberal_sunshine_hours_max": 12.0,
         "surplus_night_enabled": True,
         "surplus_night_base_load_kw": 1.5,
+        "surplus_night_morning_base_load_kw": 1.75,
+        "surplus_night_morning_start_local": "06:00",
+        "surplus_night_solar_crossover_local": "08:15",
+        "surplus_night_generator_margin_soc_percent": 7.5,
+        "surplus_night_pump_load_kw": 2.1,
+        "surplus_night_min_run_hours": 1.0,
         "surplus_night_turn_on_margin_soc_percent": 10.0,
         "surplus_night_min_turn_on_margin_soc_percent": 7.0,
         "surplus_night_next_day_sunshine_min": 9.0,

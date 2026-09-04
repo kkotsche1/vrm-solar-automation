@@ -28,7 +28,7 @@ class Settings:
     battery_min_soc_percent: float = 55.0
     battery_soft_min_soc_percent: float = 35.0
     battery_hard_min_soc_percent: float = 22.5
-    battery_capacity_kwh: float = 50.0
+    battery_capacity_kwh: float = 46.0
     battery_alert_soc_percents: tuple[float, ...] = (35.0, 25.0)
     battery_alert_rearm_margin_percent: float = 5.0
     auto_off_start_local: str = "18:00"
@@ -37,11 +37,16 @@ class Settings:
     forecast_liberal_sunshine_hours_min: float = 9.0
     forecast_liberal_sunshine_hours_max: float = 12.0
     surplus_night_enabled: bool = True
-    surplus_night_base_load_kw: float = 1.5
+    surplus_night_base_load_kw: float = 1.25
+    surplus_night_morning_base_load_kw: float = 1.75
+    surplus_night_morning_start_local: str = "06:00"
+    surplus_night_solar_crossover_local: str = "08:15"
+    surplus_night_generator_margin_soc_percent: float = 7.5
     surplus_night_turn_on_margin_soc_percent: float = 10.0
     surplus_night_min_turn_on_margin_soc_percent: float = 7.0
     surplus_night_next_day_sunshine_min: float = 9.0
-    surplus_night_pump_load_kw: float = 4.5
+    surplus_night_pump_load_kw: float = 2.1
+    surplus_night_min_run_hours: float = 1.0
     surplus_night_forced_off_start_local: str = "23:30"
     surplus_night_forced_off_end_local: str = "03:30"
     state_file: str = ".state/pump-policy-state.json"
@@ -136,7 +141,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         key="BATTERY_HARD_MIN_SOC_PERCENT",
     )
     battery_capacity_kwh = _parse_non_negative_float(
-        values.get("BATTERY_CAPACITY_KWH", "50"),
+        values.get("BATTERY_CAPACITY_KWH", "46"),
         key="BATTERY_CAPACITY_KWH",
     )
     battery_alert_soc_percents = _parse_percent_list(
@@ -168,12 +173,32 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         key="SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN",
     )
     surplus_night_base_load_kw = _parse_non_negative_float(
-        values.get("SURPLUS_NIGHT_BASE_LOAD_KW", "1.5"),
+        values.get("SURPLUS_NIGHT_BASE_LOAD_KW", "1.25"),
         key="SURPLUS_NIGHT_BASE_LOAD_KW",
     )
+    surplus_night_morning_base_load_kw = _parse_non_negative_float(
+        values.get("SURPLUS_NIGHT_MORNING_BASE_LOAD_KW", "1.75"),
+        key="SURPLUS_NIGHT_MORNING_BASE_LOAD_KW",
+    )
+    surplus_night_morning_start_local = _parse_local_hhmm(
+        values.get("SURPLUS_NIGHT_MORNING_START_LOCAL", "06:00"),
+        key="SURPLUS_NIGHT_MORNING_START_LOCAL",
+    )
+    surplus_night_solar_crossover_local = _parse_local_hhmm(
+        values.get("SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL", "08:15"),
+        key="SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL",
+    )
+    surplus_night_generator_margin_soc_percent = _parse_percent(
+        values.get("SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT", "7.5"),
+        key="SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT",
+    )
     surplus_night_pump_load_kw = _parse_non_negative_float(
-        values.get("SURPLUS_NIGHT_PUMP_LOAD_KW", "4.5"),
+        values.get("SURPLUS_NIGHT_PUMP_LOAD_KW", "2.1"),
         key="SURPLUS_NIGHT_PUMP_LOAD_KW",
+    )
+    surplus_night_min_run_hours = _parse_non_negative_float(
+        values.get("SURPLUS_NIGHT_MIN_RUN_HOURS", "1.0"),
+        key="SURPLUS_NIGHT_MIN_RUN_HOURS",
     )
     surplus_night_forced_off_start_local = _parse_local_hhmm(
         values.get("SURPLUS_NIGHT_FORCED_OFF_START_LOCAL", "23:30"),
@@ -254,7 +279,12 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             surplus_night_min_turn_on_margin_soc_percent
         ),
         surplus_night_next_day_sunshine_min=surplus_night_next_day_sunshine_min,
+        surplus_night_morning_base_load_kw=surplus_night_morning_base_load_kw,
+        surplus_night_morning_start_local=surplus_night_morning_start_local,
+        surplus_night_solar_crossover_local=surplus_night_solar_crossover_local,
+        surplus_night_generator_margin_soc_percent=surplus_night_generator_margin_soc_percent,
         surplus_night_pump_load_kw=surplus_night_pump_load_kw,
+        surplus_night_min_run_hours=surplus_night_min_run_hours,
         surplus_night_forced_off_start_local=surplus_night_forced_off_start_local,
         surplus_night_forced_off_end_local=surplus_night_forced_off_end_local,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),

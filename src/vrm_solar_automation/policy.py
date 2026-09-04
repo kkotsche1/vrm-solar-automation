@@ -105,7 +105,7 @@ class PumpDecision:
     night_reference_sunshine_hours: float | None = None
     night_surplus_mode_active: bool = False
     night_forced_off_window_active: bool = False
-    night_forced_off_reserve_soc_percent: float | None = None
+    night_pump_reserve_soc_percent: float | None = None
     effective_turn_on_soc_percent: float | None = None
     effective_turn_off_soc_percent: float | None = None
     forecast_liberal_factor: float | None = None
@@ -122,7 +122,7 @@ class PumpDecision:
             "night_reference_sunshine_hours": self.night_reference_sunshine_hours,
             "night_surplus_mode_active": self.night_surplus_mode_active,
             "night_forced_off_window_active": self.night_forced_off_window_active,
-            "night_forced_off_reserve_soc_percent": self.night_forced_off_reserve_soc_percent,
+            "night_pump_reserve_soc_percent": self.night_pump_reserve_soc_percent,
             "effective_turn_on_soc_percent": self.effective_turn_on_soc_percent,
             "effective_turn_off_soc_percent": self.effective_turn_off_soc_percent,
             "forecast_liberal_factor": self.forecast_liberal_factor,
