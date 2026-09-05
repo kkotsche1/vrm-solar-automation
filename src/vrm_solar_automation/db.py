@@ -96,6 +96,10 @@ class ControlCycleRecord(Base):
     effective_turn_on_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
     effective_turn_off_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
     forecast_liberal_factor: Mapped[float | None] = mapped_column(FLOAT)
+    daytime_surplus_override_active: Mapped[bool] = mapped_column(
+        BOOLEAN, nullable=False, default=False
+    )
+    daytime_projected_surplus_kw: Mapped[float | None] = mapped_column(FLOAT)
 
     intended_target_is_on: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
     quiet_hours_blocked: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)

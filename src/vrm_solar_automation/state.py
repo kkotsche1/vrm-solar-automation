@@ -212,6 +212,8 @@ class StateStore:
                     effective_turn_on_soc_percent=decision.effective_turn_on_soc_percent,
                     effective_turn_off_soc_percent=decision.effective_turn_off_soc_percent,
                     forecast_liberal_factor=decision.forecast_liberal_factor,
+                    daytime_surplus_override_active=decision.daytime_surplus_override_active,
+                    daytime_projected_surplus_kw=decision.daytime_projected_surplus_kw,
                     intended_target_is_on=intended_target_is_on,
                     quiet_hours_blocked=quiet_hours_blocked,
                     blocked_reason=blocked_reason,

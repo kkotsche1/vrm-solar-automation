@@ -20,7 +20,7 @@ class Settings:
     cerbo_mock_enabled: bool = False
     cerbo_fetch_retry_count: int = 2
     cerbo_fetch_retry_delay_seconds: float = 1.0
-    cerbo_unavailable_grace_cycles: int = 3
+    cerbo_unavailable_grace_cycles: int = 10
     weather_latitude: float = 39.707337
     weather_longitude: float = 2.791675
     weather_timezone: str = "Europe/Madrid"
@@ -43,7 +43,7 @@ class Settings:
     surplus_night_morning_start_local: str = "06:00"
     surplus_night_solar_crossover_local: str = "08:15"
     surplus_night_crossover_after_sunrise_minutes: float = 60.0
-    surplus_night_generator_margin_soc_percent: float = 7.5
+    surplus_night_generator_margin_soc_percent: float = 5.0
     surplus_night_turn_on_margin_soc_percent: float = 10.0
     surplus_night_min_turn_on_margin_soc_percent: float = 7.0
     surplus_night_next_day_sunshine_min: float = 9.0
@@ -51,6 +51,8 @@ class Settings:
     surplus_night_min_run_hours: float = 1.0
     surplus_night_forced_off_start_local: str = "23:30"
     surplus_night_forced_off_end_local: str = "03:30"
+    daytime_surplus_turn_on_enabled: bool = True
+    daytime_surplus_margin_kw: float = 0.5
     state_file: str = ".state/pump-policy-state.json"
     database_url: str = "sqlite:///.state/automation.db"
     database_auto_migrate: bool = False
@@ -123,7 +125,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         key="CERBO_FETCH_RETRY_DELAY_SECONDS",
     )
     cerbo_unavailable_grace_cycles = _parse_non_negative_int(
-        values.get("CERBO_UNAVAILABLE_GRACE_CYCLES", "3"),
+        values.get("CERBO_UNAVAILABLE_GRACE_CYCLES", "10"),
         key="CERBO_UNAVAILABLE_GRACE_CYCLES",
     )
     sunshine_hours_min = _parse_hours(
@@ -195,7 +197,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         key="SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES",
     )
     surplus_night_generator_margin_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT", "7.5"),
+        values.get("SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT", "5.0"),
         key="SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT",
     )
     surplus_night_pump_load_kw = _parse_non_negative_float(
@@ -213,6 +215,10 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     surplus_night_forced_off_end_local = _parse_local_hhmm(
         values.get("SURPLUS_NIGHT_FORCED_OFF_END_LOCAL", "03:30"),
         key="SURPLUS_NIGHT_FORCED_OFF_END_LOCAL",
+    )
+    daytime_surplus_margin_kw = _parse_non_negative_float(
+        values.get("DAYTIME_SURPLUS_MARGIN_KW", "0.5"),
+        key="DAYTIME_SURPLUS_MARGIN_KW",
     )
     if battery_hard_min_soc_percent > battery_soft_min_soc_percent:
         raise ValueError(
@@ -297,6 +303,10 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         surplus_night_min_run_hours=surplus_night_min_run_hours,
         surplus_night_forced_off_start_local=surplus_night_forced_off_start_local,
         surplus_night_forced_off_end_local=surplus_night_forced_off_end_local,
+        daytime_surplus_turn_on_enabled=values.get(
+            "DAYTIME_SURPLUS_TURN_ON_ENABLED", "true"
+        ).lower() in {"1", "true", "yes", "on"},
+        daytime_surplus_margin_kw=daytime_surplus_margin_kw,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),
         database_url=values.get("DATABASE_URL", "sqlite:///.state/automation.db"),
         database_auto_migrate=values.get("DATABASE_AUTO_MIGRATE", "false").lower() in {

@@ -369,7 +369,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 surplus_night_enabled=False,
             ),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=40.0)
+                _build_power_snapshot(
+                    generator_watts=0.0, battery_soc_percent=40.0, solar_watts=200.0
+                )
             ),
             weather_client=FakeWeatherClient(
                 _build_sunny_weather(today_sunshine_hours=10.5, tomorrow_sunshine_hours=10.5)
@@ -421,7 +423,9 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
                 auto_control_timezone="UTC",
             ),
             probe_client=FakeProbeClient(
-                _build_power_snapshot(generator_watts=0.0, battery_soc_percent=40.0)
+                _build_power_snapshot(
+                    generator_watts=0.0, battery_soc_percent=40.0, solar_watts=200.0
+                )
             ),
             weather_client=FakeWeatherClient(_build_sunny_weather(today_sunshine_hours=9.0)),
             state_store=state_store,
@@ -433,6 +437,140 @@ class PumpPolicyAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.should_turn_on)
         self.assertAlmostEqual(float(payload["effective_turn_off_soc_percent"]), 45.0, places=1)
         self.assertIn("needs at least 45.0% SOC to keep running", decision.reason)
+
+    async def test_daytime_solar_surplus_starts_pump_below_turn_on_threshold(self) -> None:
+        # The real 2026-09-05 morning lockout: the overnight reserve landed the battery at
+        # 38% by design, below the 40% daytime gate, while the panels ran 4 kW clear of the
+        # house. Running the pump there charges the battery, so the SOC gate does not apply.
+        system = PumpControlSystem(
+            _test_settings(auto_control_timezone="UTC"),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(
+                    generator_watts=0.0,
+                    battery_soc_percent=38.0,
+                    solar_watts=6400.0,
+                    house_watts=2400.0,
+                )
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=12.4, tomorrow_sunshine_hours=12.4)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 9, 5, 9, 20),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(decision.action, "turn_on")
+        self.assertTrue(payload["daytime_surplus_override_active"])
+        self.assertAlmostEqual(float(payload["daytime_projected_surplus_kw"]), 1.9, places=2)
+        self.assertIn("below the adaptive 40.0% turn-on threshold", decision.reason)
+
+    async def test_daytime_solar_surplus_does_not_start_pump_below_generator_floor(self) -> None:
+        system = PumpControlSystem(
+            _test_settings(auto_control_timezone="UTC"),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(
+                    generator_watts=0.0,
+                    battery_soc_percent=27.0,
+                    solar_watts=6400.0,
+                    house_watts=2400.0,
+                )
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=12.4, tomorrow_sunshine_hours=12.4)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 9, 5, 9, 20),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertFalse(payload["daytime_surplus_override_active"])
+
+    async def test_daytime_solar_surplus_needs_to_cover_the_pump_draw(self) -> None:
+        # Surplus that only covers the pump with no margin must not start it: the plug
+        # commits a compressor run that cannot be cancelled if a cloud takes the sun.
+        system = PumpControlSystem(
+            _test_settings(auto_control_timezone="UTC"),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(
+                    generator_watts=0.0,
+                    battery_soc_percent=38.0,
+                    solar_watts=2700.0,
+                    house_watts=400.0,
+                )
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=12.4, tomorrow_sunshine_hours=12.4)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 9, 5, 9, 20),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertFalse(payload["daytime_surplus_override_active"])
+        self.assertAlmostEqual(float(payload["daytime_projected_surplus_kw"]), 0.2, places=2)
+
+    async def test_daytime_solar_surplus_keeps_running_pump_below_turn_off_threshold(self) -> None:
+        # A running pump is already inside house_watts, so its draw is not subtracted twice.
+        state_store = FakeStateStore()
+        state_store.state = PumpPolicyState(
+            is_on=True,
+            changed_at_iso=datetime(2026, 9, 5, 9, 0, tzinfo=UTC).isoformat(),
+        )
+        system = PumpControlSystem(
+            _test_settings(auto_control_timezone="UTC"),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(
+                    generator_watts=0.0,
+                    battery_soc_percent=33.0,
+                    solar_watts=6400.0,
+                    house_watts=3800.0,
+                )
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=12.4, tomorrow_sunshine_hours=12.4)
+            ),
+            state_store=state_store,
+            now_provider=_fixed_now(2026, 9, 5, 9, 20),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertTrue(decision.should_turn_on)
+        self.assertEqual(decision.action, "keep_on")
+        self.assertTrue(payload["daytime_surplus_override_active"])
+        self.assertAlmostEqual(float(payload["daytime_projected_surplus_kw"]), 2.6, places=2)
+
+    async def test_daytime_solar_surplus_override_can_be_disabled(self) -> None:
+        system = PumpControlSystem(
+            _test_settings(
+                auto_control_timezone="UTC", daytime_surplus_turn_on_enabled=False
+            ),
+            probe_client=FakeProbeClient(
+                _build_power_snapshot(
+                    generator_watts=0.0,
+                    battery_soc_percent=38.0,
+                    solar_watts=6400.0,
+                    house_watts=2400.0,
+                )
+            ),
+            weather_client=FakeWeatherClient(
+                _build_sunny_weather(today_sunshine_hours=12.4, tomorrow_sunshine_hours=12.4)
+            ),
+            state_store=FakeStateStore(),
+            now_provider=_fixed_now(2026, 9, 5, 9, 20),
+        )
+
+        decision, payload = await system.evaluate()
+
+        self.assertFalse(decision.should_turn_on)
+        self.assertFalse(payload["daytime_surplus_override_active"])
 
     async def test_daytime_keep_running_threshold_is_time_independent(self) -> None:
         thresholds = []

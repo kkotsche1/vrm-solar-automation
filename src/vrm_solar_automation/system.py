@@ -107,6 +107,15 @@ class PumpControlSystem:
             forecast_liberal_sunshine_hours_max=settings.forecast_liberal_sunshine_hours_max,
             battery_alert_soc_percents=settings.battery_alert_soc_percents,
             battery_alert_rearm_margin_percent=settings.battery_alert_rearm_margin_percent,
+            daytime_surplus_turn_on_enabled=settings.daytime_surplus_turn_on_enabled,
+            daytime_surplus_pump_load_kw=settings.surplus_night_pump_load_kw,
+            daytime_surplus_margin_kw=settings.daytime_surplus_margin_kw,
+            # Same landing point the overnight reserve is budgeted to, so the daytime
+            # override cannot spend the reserve the night policy just protected.
+            daytime_surplus_floor_soc=(
+                settings.battery_hard_min_soc_percent
+                + settings.surplus_night_generator_margin_soc_percent
+            ),
         )
         self._policy = policy or PumpPolicy(policy_config)
         self._generator_alert_threshold_watts = policy_config.generator_alert_watts
@@ -1324,6 +1333,8 @@ class PumpControlSystem:
             "night_surplus_mode_active": decision.night_surplus_mode_active,
             "night_forced_off_window_active": decision.night_forced_off_window_active,
             "night_pump_reserve_soc_percent": decision.night_pump_reserve_soc_percent,
+            "daytime_surplus_override_active": decision.daytime_surplus_override_active,
+            "daytime_projected_surplus_kw": decision.daytime_projected_surplus_kw,
             "night_solar_crossover_local": decision.night_solar_crossover_local,
             "night_solar_crossover_source": decision.night_solar_crossover_source,
             "effective_turn_on_soc_percent": decision.effective_turn_on_soc_percent,

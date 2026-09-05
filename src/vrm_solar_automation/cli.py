@@ -220,6 +220,8 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
                 "Forced-off window: active | "
                 f"reserve {_format_optional_percent(payload.get('night_pump_reserve_soc_percent'))}"
             )
+    else:
+        _print_daytime_surplus(payload)
     return 0
 
 
@@ -275,6 +277,8 @@ async def _run_control(env_file: str, as_json: bool) -> int:
                 "Forced-off window: active | "
                 f"reserve {_format_optional_percent(payload.get('night_pump_reserve_soc_percent'))}"
             )
+    else:
+        _print_daytime_surplus(payload)
     print(f"Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"Command sent: {actuation['command_sent']}")
@@ -512,3 +516,11 @@ def main() -> None:
             )
         )
     raise SystemExit(2)
+
+
+def _print_daytime_surplus(payload: dict[str, object]) -> None:
+    surplus = payload.get("daytime_projected_surplus_kw")
+    if surplus is None:
+        return
+    state = "override active" if payload.get("daytime_surplus_override_active") else "inactive"
+    print(f"Solar surplus: {float(surplus):.2f} kW with pump running | {state}")

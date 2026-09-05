@@ -56,7 +56,7 @@ CERBO_SITE_IDENTIFIER=cerbo-local
 CERBO_MOCK_ENABLED=false
 CERBO_FETCH_RETRY_COUNT=2
 CERBO_FETCH_RETRY_DELAY_SECONDS=1.0
-CERBO_UNAVAILABLE_GRACE_CYCLES=3
+CERBO_UNAVAILABLE_GRACE_CYCLES=10
 WEATHER_LATITUDE=39.707337
 WEATHER_LONGITUDE=2.791675
 WEATHER_TIMEZONE=Europe/Madrid
@@ -79,8 +79,10 @@ SURPLUS_NIGHT_MORNING_BASE_LOAD_KW=1.75
 SURPLUS_NIGHT_MORNING_START_LOCAL=06:00
 SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES=60
 SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL=08:15
-SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT=7.5
+SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT=5.0
 SURPLUS_NIGHT_PUMP_LOAD_KW=2.1
+DAYTIME_SURPLUS_TURN_ON_ENABLED=true
+DAYTIME_SURPLUS_MARGIN_KW=0.5
 SURPLUS_NIGHT_MIN_RUN_HOURS=1.0
 SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=10
 SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT=7
@@ -103,7 +105,7 @@ Cerbo reads are now hardened against transient Modbus/TCP dropouts:
 
 - `CERBO_FETCH_RETRY_COUNT` controls the number of retry attempts after the initial Cerbo read fails.
 - `CERBO_FETCH_RETRY_DELAY_SECONDS` controls the fixed delay between retry attempts.
-- `CERBO_UNAVAILABLE_GRACE_CYCLES` controls how many consecutive failed control cycles may preserve an already-running automatic `ON` target before the controller fails safe to `OFF`.
+- `CERBO_UNAVAILABLE_GRACE_CYCLES` controls how many consecutive failed control cycles may preserve an already-running automatic `ON` target before the controller fails safe to `OFF`. Control cycles run every 30 s, so this is a wall-clock tolerance: `10` rides out roughly five minutes of Cerbo unreachability. Size it above the longest normal network dropout — observed Cerbo Wi-Fi dropouts reach ~130 s, so `3` (~60 s) tripped the fail-safe about once a day and cycled the pump for nothing.
 
 Grace applies only to preserving an already-running automatic target. The controller never turns the pump on without a fresh successful Cerbo read.
 
@@ -117,6 +119,19 @@ The daytime SOC settings are now forecast-adaptive instead of using a single fix
 - `FORECAST_LIBERAL_SUNSHINE_HOURS_MIN` and `FORECAST_LIBERAL_SUNSHINE_HOURS_MAX` define how quickly the controller interpolates from the conservative threshold toward the softer sunny-day thresholds.
 - `BATTERY_CAPACITY_KWH` is used by reserve-aware night mode to convert base-load energy into an SOC reserve.
 
+### Daytime solar-surplus override
+
+The adaptive SOC thresholds are blind to production, which makes them wrong in exactly one situation: the morning handover. Reserve-aware night control is budgeted to land the battery on the night floor at solar crossover, and that floor sits below the daytime turn-on threshold, so on a clear morning the pump is locked out of the strongest sun of the day while the panels spill surplus.
+
+When live solar covers the pump's own draw with `DAYTIME_SURPLUS_MARGIN_KW` to spare, the battery is not the energy source and the SOC gate is measuring the wrong thing, so it is bypassed for both turning on and keeping running. The pump draw is taken from `SURPLUS_NIGHT_PUMP_LOAD_KW` and is only subtracted when the pump is off, because `house_watts` already contains it while it runs.
+
+Two limits still apply, because surplus can vanish behind a cloud and a start commits a compressor run that cannot be cancelled:
+
+- SOC must be strictly above the night floor (`BATTERY_HARD_MIN_SOC_PERCENT + SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT`), so the override can never spend the reserve the night policy just protected.
+- The sunshine-forecast gate (`SUNSHINE_HOURS_MIN`) and the hard floor are unaffected; the override only relaxes the adaptive SOC thresholds.
+
+Set `DAYTIME_SURPLUS_TURN_ON_ENABLED=false` to restore pure SOC-gated daytime control.
+
 There are exactly two control modes and no time-of-day bias within either one: the daytime adaptive policy, and reserve-aware night control. Daytime SOC thresholds depend only on the forecast, never on the clock.
 
 `AUTO_OFF_START_LOCAL` and `AUTO_RESUME_START_LOCAL` define the overnight control window in `AUTO_CONTROL_TIMEZONE`. With `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware overnight automation instead of a hard forced-`OFF` quiet-hours block.
@@ -128,7 +143,7 @@ The surplus-night settings keep the logic simple and deterministic:
 
 - `SURPLUS_NIGHT_BASE_LOAD_KW` is the overnight house base load through the small hours, and `SURPLUS_NIGHT_MORNING_BASE_LOAD_KW` the heavier load from `SURPLUS_NIGHT_MORNING_START_LOCAL` until solar takes over.
 - `SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES` is how long after the forecast sunrise the panels are expected to start carrying the house. `SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL` is the fixed fallback used only when no sunrise is available.
-- `SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT` is headroom above the hard floor. The generator auto-starts on sagging DC voltage, so its effective SOC trip point rises with load.
+- `SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT` is headroom above the hard floor. The generator auto-starts on sagging DC voltage, so its effective SOC trip point rises with load. With the production values (`22.5` + `5.0`) the night reserve targets **27.5% SOC at solar crossover**.
 - `SURPLUS_NIGHT_PUMP_LOAD_KW` is the average draw while the plug is on, and `SURPLUS_NIGHT_MIN_RUN_HOURS` the compressor run a start commits to, since it cannot be cancelled once triggered.
 - `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT` is the conservative night turn-on margin, pure hysteresis gating restarts only.
 - `SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT` is the softened turn-on margin used on the strongest solar forecasts.
@@ -305,6 +320,7 @@ The controller follows a small deterministic flow:
    - keep the daytime demand gate based on `today_sunshine_hours`, but use the weaker of `today_sunshine_hours` and `tomorrow_sunshine_hours` to decide how conservative daytime SOC thresholds should be
    - use that factor to interpolate between `BATTERY_MIN_SOC_PERCENT` and the sunny-day thresholds derived from `BATTERY_SOFT_MIN_SOC_PERCENT`
    - these thresholds do not vary with time of day
+   - override the turn-on and keep-running thresholds when live solar covers the pump with `DAYTIME_SURPLUS_MARGIN_KW` to spare and SOC is above the night floor
 6. During the overnight window (`AUTO_OFF_START_LOCAL` to `AUTO_RESUME_START_LOCAL`):
    - if `SURPLUS_NIGHT_ENABLED=false`, the pump target is forced `OFF`
    - if `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware night mode
@@ -327,6 +343,7 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 - weather snapshot used for policy evaluation, including `today_sunshine_hours`, `tomorrow_sunshine_hours`, plus `weather_source` (`live`, `same_day_cache`, or `unavailable`)
 - policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`, `soc_control_mode`)
 - adaptive SOC diagnostics (`effective_turn_on_soc_percent`, `effective_turn_off_soc_percent`, `forecast_liberal_factor`)
+- daytime solar-surplus diagnostics (`daytime_projected_surplus_kw`, `daytime_surplus_override_active`)
 - reserve-aware night diagnostics (`night_required_soc_percent`, `night_surplus_mode_active`) when the overnight rule is active
 - intended target and quiet-hours block metadata
 - Shelly actuation result (`status`, command, observed before/after, error)
