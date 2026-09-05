@@ -100,6 +100,10 @@ class ControlCycleRecord(Base):
         BOOLEAN, nullable=False, default=False
     )
     daytime_projected_surplus_kw: Mapped[float | None] = mapped_column(FLOAT)
+    generator_start_blocked: Mapped[bool] = mapped_column(
+        BOOLEAN, nullable=False, default=False
+    )
+    night_forced_off_reserve_soc_percent: Mapped[float | None] = mapped_column(FLOAT)
 
     intended_target_is_on: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)
     quiet_hours_blocked: Mapped[bool] = mapped_column(BOOLEAN, nullable=False)

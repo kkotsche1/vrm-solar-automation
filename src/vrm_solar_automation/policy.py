@@ -129,6 +129,8 @@ class PumpDecision:
     forecast_liberal_factor: float | None = None
     daytime_surplus_override_active: bool = False
     daytime_projected_surplus_kw: float | None = None
+    night_forced_off_reserve_soc_percent: float | None = None
+    generator_start_blocked: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -150,6 +152,8 @@ class PumpDecision:
             "forecast_liberal_factor": self.forecast_liberal_factor,
             "daytime_surplus_override_active": self.daytime_surplus_override_active,
             "daytime_projected_surplus_kw": self.daytime_projected_surplus_kw,
+            "night_forced_off_reserve_soc_percent": self.night_forced_off_reserve_soc_percent,
+            "generator_start_blocked": self.generator_start_blocked,
         }
 
 

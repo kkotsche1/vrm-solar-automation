@@ -218,10 +218,14 @@ async def _run_decision(env_file: str, as_json: bool) -> int:
         if payload.get("night_forced_off_window_active"):
             print(
                 "Forced-off window: active | "
-                f"reserve {_format_optional_percent(payload.get('night_pump_reserve_soc_percent'))}"
+                f"pump reserve {_format_optional_percent(payload.get('night_pump_reserve_soc_percent'))}"
+                " | window reserve "
+                f"{_format_optional_percent(payload.get('night_forced_off_reserve_soc_percent'))}"
             )
     else:
         _print_daytime_surplus(payload)
+    if payload.get("generator_start_blocked"):
+        print("Generator start guard: start blocked while the generator runs")
     return 0
 
 
@@ -275,10 +279,14 @@ async def _run_control(env_file: str, as_json: bool) -> int:
         if payload.get("night_forced_off_window_active"):
             print(
                 "Forced-off window: active | "
-                f"reserve {_format_optional_percent(payload.get('night_pump_reserve_soc_percent'))}"
+                f"pump reserve {_format_optional_percent(payload.get('night_pump_reserve_soc_percent'))}"
+                " | window reserve "
+                f"{_format_optional_percent(payload.get('night_forced_off_reserve_soc_percent'))}"
             )
     else:
         _print_daytime_surplus(payload)
+    if payload.get("generator_start_blocked"):
+        print("Generator start guard: start blocked while the generator runs")
     print(f"Actuation status: {actuation['status']}")
     if actuation["command_sent"]:
         print(f"Command sent: {actuation['command_sent']}")

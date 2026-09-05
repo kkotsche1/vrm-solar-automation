@@ -53,6 +53,7 @@ class Settings:
     surplus_night_forced_off_end_local: str = "03:30"
     daytime_surplus_turn_on_enabled: bool = True
     daytime_surplus_margin_kw: float = 0.5
+    generator_block_start_watts: float = 100.0
     state_file: str = ".state/pump-policy-state.json"
     database_url: str = "sqlite:///.state/automation.db"
     database_auto_migrate: bool = False
@@ -220,6 +221,10 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         values.get("DAYTIME_SURPLUS_MARGIN_KW", "0.5"),
         key="DAYTIME_SURPLUS_MARGIN_KW",
     )
+    generator_block_start_watts = _parse_non_negative_float(
+        values.get("GENERATOR_BLOCK_START_WATTS", "100"),
+        key="GENERATOR_BLOCK_START_WATTS",
+    )
     if battery_hard_min_soc_percent > battery_soft_min_soc_percent:
         raise ValueError(
             "BATTERY_HARD_MIN_SOC_PERCENT must be less than or equal to "
@@ -307,6 +312,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
             "DAYTIME_SURPLUS_TURN_ON_ENABLED", "true"
         ).lower() in {"1", "true", "yes", "on"},
         daytime_surplus_margin_kw=daytime_surplus_margin_kw,
+        generator_block_start_watts=generator_block_start_watts,
         state_file=values.get("PUMP_POLICY_STATE_FILE", ".state/pump-policy-state.json"),
         database_url=values.get("DATABASE_URL", "sqlite:///.state/automation.db"),
         database_auto_migrate=values.get("DATABASE_AUTO_MIGRATE", "false").lower() in {

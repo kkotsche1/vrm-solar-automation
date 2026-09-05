@@ -83,6 +83,7 @@ SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT=5.0
 SURPLUS_NIGHT_PUMP_LOAD_KW=2.1
 DAYTIME_SURPLUS_TURN_ON_ENABLED=true
 DAYTIME_SURPLUS_MARGIN_KW=0.5
+GENERATOR_BLOCK_START_WATTS=100
 SURPLUS_NIGHT_MIN_RUN_HOURS=1.0
 SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=10
 SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT=7
@@ -145,6 +146,12 @@ The surplus-night settings keep the logic simple and deterministic:
 - `SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES` is how long after the forecast sunrise the panels are expected to start carrying the house. `SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL` is the fixed fallback used only when no sunrise is available.
 - `SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT` is headroom above the hard floor. The generator auto-starts on sagging DC voltage, so its effective SOC trip point rises with load. With the production values (`22.5` + `5.0`) the night reserve targets **27.5% SOC at solar crossover**.
 - `SURPLUS_NIGHT_PUMP_LOAD_KW` is the average draw while the plug is on, and `SURPLUS_NIGHT_MIN_RUN_HOURS` the compressor run a start commits to, since it cannot be cancelled once triggered.
+
+### Forced-off window
+
+`SURPLUS_NIGHT_FORCED_OFF_START_LOCAL` to `SURPLUS_NIGHT_FORCED_OFF_END_LOCAL` marks the stretch of the night where a start is worst: the battery would land on the floor with no sun left to answer for it. Inside the window both the keep-running and turn-on thresholds additionally carry the pump's draw for the remainder of the window, so the pump may run only on genuine excess SOC rather than being blocked outright. The reserve shrinks to zero at the window end and is capped at the time left to solar crossover, so it cannot outlast the night it is budgeting.
+
+The start reserve (`SURPLUS_NIGHT_MIN_RUN_HOURS`) and the window reserve both cover the same pump over overlapping stretches, so the turn-on threshold takes the larger of the two rather than stacking them.
 - `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT` is the conservative night turn-on margin, pure hysteresis gating restarts only.
 - `SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT` is the softened turn-on margin used on the strongest solar forecasts.
 - `SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN` is the required sunshine-hours forecast for the next daylight period before night runtime is allowed.
@@ -308,7 +315,7 @@ The controller follows a small deterministic flow:
    - preserve an already-running automatic `ON` target through up to `CERBO_UNAVAILABLE_GRACE_CYCLES - 1` consecutive failed cycles
    - fail safe to `OFF` on the cycle that reaches `CERBO_UNAVAILABLE_GRACE_CYCLES`
    - never turn the pump `ON` without a fresh successful Cerbo read
-3. Generator power does not gate the pump. Battery SOC is the only power-side turn-off trigger; generator power is reported and alerted on, but never forces `OFF` on its own.
+3. Generator power gates *starts* only. While the generator supplies `GENERATOR_BLOCK_START_WATTS` or more, the pump is never started, in any mode: a start would spend generator charge on a compressor run and hold the generator under load. A pump already running is left alone, because its compressor cycle is committed and stopping it mid-run would cycle the plug without recovering the energy. Generator power never forces `OFF` on its own, and battery SOC remains the only power-side turn-off trigger. Set `GENERATOR_BLOCK_START_WATTS=0` to disable the guard.
 4. Use the daily Open-Meteo sunshine forecast to determine daytime demand:
    - `sufficient_sun` when `today_sunshine_hours >= SUNSHINE_HOURS_MIN`
    - `insufficient_sun` when `today_sunshine_hours < SUNSHINE_HOURS_MIN`
@@ -344,6 +351,7 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 - policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`, `soc_control_mode`)
 - adaptive SOC diagnostics (`effective_turn_on_soc_percent`, `effective_turn_off_soc_percent`, `forecast_liberal_factor`)
 - daytime solar-surplus diagnostics (`daytime_projected_surplus_kw`, `daytime_surplus_override_active`)
+- the generator start guard (`generator_start_blocked`) and the forced-off window reserve (`night_forced_off_reserve_soc_percent`)
 - reserve-aware night diagnostics (`night_required_soc_percent`, `night_surplus_mode_active`) when the overnight rule is active
 - intended target and quiet-hours block metadata
 - Shelly actuation result (`status`, command, observed before/after, error)
