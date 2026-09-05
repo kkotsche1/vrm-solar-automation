@@ -215,9 +215,6 @@ class StateStore:
                     daytime_surplus_override_active=decision.daytime_surplus_override_active,
                     daytime_projected_surplus_kw=decision.daytime_projected_surplus_kw,
                     generator_start_blocked=decision.generator_start_blocked,
-                    night_forced_off_reserve_soc_percent=(
-                        decision.night_forced_off_reserve_soc_percent
-                    ),
                     intended_target_is_on=intended_target_is_on,
                     quiet_hours_blocked=quiet_hours_blocked,
                     blocked_reason=blocked_reason,

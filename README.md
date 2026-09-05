@@ -79,14 +79,13 @@ SURPLUS_NIGHT_MORNING_BASE_LOAD_KW=1.75
 SURPLUS_NIGHT_MORNING_START_LOCAL=06:00
 SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES=60
 SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL=08:15
-SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT=5.0
+SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT=2.5
 SURPLUS_NIGHT_PUMP_LOAD_KW=2.1
 DAYTIME_SURPLUS_TURN_ON_ENABLED=true
 DAYTIME_SURPLUS_MARGIN_KW=0.5
 GENERATOR_BLOCK_START_WATTS=100
 SURPLUS_NIGHT_MIN_RUN_HOURS=1.0
-SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=10
-SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT=7
+SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=2
 SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN=9.0
 DATABASE_URL=sqlite:///.state/automation.db
 DATABASE_AUTO_MIGRATE=false
@@ -144,21 +143,17 @@ The surplus-night settings keep the logic simple and deterministic:
 
 - `SURPLUS_NIGHT_BASE_LOAD_KW` is the overnight house base load through the small hours, and `SURPLUS_NIGHT_MORNING_BASE_LOAD_KW` the heavier load from `SURPLUS_NIGHT_MORNING_START_LOCAL` until solar takes over.
 - `SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES` is how long after the forecast sunrise the panels are expected to start carrying the house. `SURPLUS_NIGHT_SOLAR_CROSSOVER_LOCAL` is the fixed fallback used only when no sunrise is available.
-- `SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT` is headroom above the hard floor. The generator auto-starts on sagging DC voltage, so its effective SOC trip point rises with load. With the production values (`22.5` + `5.0`) the night reserve targets **27.5% SOC at solar crossover**.
+- `SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT` is headroom above the hard floor. The generator auto-starts on sagging DC voltage, so its effective SOC trip point rises with load; at crossover the pump is off, so the trip point is at its lowest. With the production values (`22.5` + `2.5`) the night reserve targets **25% SOC at solar crossover**.
 - `SURPLUS_NIGHT_PUMP_LOAD_KW` is the average draw while the plug is on, and `SURPLUS_NIGHT_MIN_RUN_HOURS` the compressor run a start commits to, since it cannot be cancelled once triggered.
 
-### Forced-off window
-
-`SURPLUS_NIGHT_FORCED_OFF_START_LOCAL` to `SURPLUS_NIGHT_FORCED_OFF_END_LOCAL` marks the stretch of the night where a start is worst: the battery would land on the floor with no sun left to answer for it. Inside the window both the keep-running and turn-on thresholds additionally carry the pump's draw for the remainder of the window, so the pump may run only on genuine excess SOC rather than being blocked outright. The reserve shrinks to zero at the window end and is capped at the time left to solar crossover, so it cannot outlast the night it is budgeting.
-
-The start reserve (`SURPLUS_NIGHT_MIN_RUN_HOURS`) and the window reserve both cover the same pump over overlapping stretches, so the turn-on threshold takes the larger of the two rather than stacking them.
-- `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT` is the conservative night turn-on margin, pure hysteresis gating restarts only.
-- `SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT` is the softened turn-on margin used on the strongest solar forecasts.
+- `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT` is a small margin on the turn-on threshold only, so a start is worth making rather than immediately undone.
 - `SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN` is the required sunshine-hours forecast for the next daylight period before night runtime is allowed.
 
 The night reserve is `night floor + base-load energy still to be drawn before solar crossover`, where the night floor is `BATTERY_HARD_MIN_SOC_PERCENT + SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT`. Crossover is derived from the forecast sunrise rather than a clock time, because sunrise moves about two hours across the year here; it is *not* `AUTO_RESUME_START_LOCAL`, which is only when daytime control resumes.
 
-With the production settings (`30 %` night floor, `46 kWh`, `1.25`/`1.75 kW`, crossover at sunrise + 60 min) the keep-running threshold runs `68.5 %` at `19:00`, `52.1 %` at `01:00`, `41.3 %` at `05:00` and `38.6 %` at `06:00` — it no longer decays onto the floor before dawn. Turning *on* additionally costs the committed compressor run, so a start is dearer than continuing.
+This is the whole night rule, and deliberately the only one: run until the battery holds exactly what base load needs to reach crossover on the night floor, then stop. Nothing else caps the run, because nothing else has to — the reserve already accounts for every remaining hour, so any second limit on top of it only cuts pump runtime without protecting anything the reserve had missed.
+
+With the production settings (`25 %` night floor, `46 kWh`, `1.25`/`1.75 kW`, crossover at sunrise + 60 min) the keep-running threshold runs `63.8 %` at `19:00`, `47.5 %` at `01:00`, `36.6 %` at `05:00` and `30.1 %` at `07:00`, landing on `25 %` at crossover. Turning *on* additionally costs the committed compressor run plus `SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT`, so a start is dearer than continuing.
 
 `scripts/night_reserve_backtest.py` replays the logged nights through the old and new models, simulating each night forward from its 19:00 SOC using loads measured from the same capture. Use `--set FIELD=VALUE` to try a different tuning before deploying it.
 
@@ -332,7 +327,7 @@ The controller follows a small deterministic flow:
    - if `SURPLUS_NIGHT_ENABLED=false`, the pump target is forced `OFF`
    - if `SURPLUS_NIGHT_ENABLED=true`, the controller switches to reserve-aware night mode
    - after the nightly start time, the night rule uses tomorrow's sunshine forecast; after midnight it uses today's sunshine forecast
-   - the reserve is `BATTERY_HARD_MIN_SOC_PERCENT` plus the base-load energy still to be drawn before `AUTO_RESUME_START_LOCAL`, so it decays through the night
+   - the reserve is the night floor plus the base-load energy still to be drawn before solar crossover, so it decays through the night and lands on the floor exactly when solar takes over
    - the pump keeps running down to exactly that reserve, landing the battery on `BATTERY_HARD_MIN_SOC_PERCENT` at resume time
    - turning `ON` additionally requires a hysteresis margin above the reserve, softened on stronger solar forecasts
 
@@ -351,7 +346,7 @@ The controller uses a SQLite database (default: `.state/automation.db`) for pers
 - policy decision fields (`should_turn_on`, `action`, `reason`, `weather_mode`, `soc_control_mode`)
 - adaptive SOC diagnostics (`effective_turn_on_soc_percent`, `effective_turn_off_soc_percent`, `forecast_liberal_factor`)
 - daytime solar-surplus diagnostics (`daytime_projected_surplus_kw`, `daytime_surplus_override_active`)
-- the generator start guard (`generator_start_blocked`) and the forced-off window reserve (`night_forced_off_reserve_soc_percent`)
+- the generator start guard (`generator_start_blocked`)
 - reserve-aware night diagnostics (`night_required_soc_percent`, `night_surplus_mode_active`) when the overnight rule is active
 - intended target and quiet-hours block metadata
 - Shelly actuation result (`status`, command, observed before/after, error)

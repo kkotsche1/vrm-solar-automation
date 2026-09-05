@@ -126,11 +126,8 @@ class ConfigTests(unittest.TestCase):
                         "SURPLUS_NIGHT_ENABLED=false",
                         "SURPLUS_NIGHT_BASE_LOAD_KW=1.7",
                         "SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT=12",
-                        "SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT=8",
                         "SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN=9.5",
                         "SURPLUS_NIGHT_PUMP_LOAD_KW=4.2",
-                        "SURPLUS_NIGHT_FORCED_OFF_START_LOCAL=23:30",
-                        "SURPLUS_NIGHT_FORCED_OFF_END_LOCAL=03:15",
                     ]
                 )
                 + "\n",
@@ -142,11 +139,8 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(settings.surplus_night_enabled)
         self.assertEqual(settings.surplus_night_base_load_kw, 1.7)
         self.assertEqual(settings.surplus_night_turn_on_margin_soc_percent, 12.0)
-        self.assertEqual(settings.surplus_night_min_turn_on_margin_soc_percent, 8.0)
         self.assertEqual(settings.surplus_night_next_day_sunshine_min, 9.5)
         self.assertEqual(settings.surplus_night_pump_load_kw, 4.2)
-        self.assertEqual(settings.surplus_night_forced_off_start_local, "23:30")
-        self.assertEqual(settings.surplus_night_forced_off_end_local, "03:15")
 
     def test_load_settings_rejects_invalid_sunshine_hours_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -43,14 +43,11 @@ class Settings:
     surplus_night_morning_start_local: str = "06:00"
     surplus_night_solar_crossover_local: str = "08:15"
     surplus_night_crossover_after_sunrise_minutes: float = 60.0
-    surplus_night_generator_margin_soc_percent: float = 5.0
-    surplus_night_turn_on_margin_soc_percent: float = 10.0
-    surplus_night_min_turn_on_margin_soc_percent: float = 7.0
+    surplus_night_generator_margin_soc_percent: float = 2.5
+    surplus_night_turn_on_margin_soc_percent: float = 2.0
     surplus_night_next_day_sunshine_min: float = 9.0
     surplus_night_pump_load_kw: float = 2.1
     surplus_night_min_run_hours: float = 1.0
-    surplus_night_forced_off_start_local: str = "23:30"
-    surplus_night_forced_off_end_local: str = "03:30"
     daytime_surplus_turn_on_enabled: bool = True
     daytime_surplus_margin_kw: float = 0.5
     generator_block_start_watts: float = 100.0
@@ -166,12 +163,8 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         key="FORECAST_LIBERAL_SUNSHINE_HOURS_MAX",
     )
     surplus_night_turn_on_margin_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT", "10"),
+        values.get("SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT", "2"),
         key="SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT",
-    )
-    surplus_night_min_turn_on_margin_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT", "7"),
-        key="SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT",
     )
     surplus_night_next_day_sunshine_min = _parse_hours(
         values.get("SURPLUS_NIGHT_NEXT_DAY_SUNSHINE_MIN", "9.0"),
@@ -198,7 +191,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         key="SURPLUS_NIGHT_CROSSOVER_AFTER_SUNRISE_MINUTES",
     )
     surplus_night_generator_margin_soc_percent = _parse_percent(
-        values.get("SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT", "5.0"),
+        values.get("SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT", "2.5"),
         key="SURPLUS_NIGHT_GENERATOR_MARGIN_SOC_PERCENT",
     )
     surplus_night_pump_load_kw = _parse_non_negative_float(
@@ -208,14 +201,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     surplus_night_min_run_hours = _parse_non_negative_float(
         values.get("SURPLUS_NIGHT_MIN_RUN_HOURS", "1.0"),
         key="SURPLUS_NIGHT_MIN_RUN_HOURS",
-    )
-    surplus_night_forced_off_start_local = _parse_local_hhmm(
-        values.get("SURPLUS_NIGHT_FORCED_OFF_START_LOCAL", "23:30"),
-        key="SURPLUS_NIGHT_FORCED_OFF_START_LOCAL",
-    )
-    surplus_night_forced_off_end_local = _parse_local_hhmm(
-        values.get("SURPLUS_NIGHT_FORCED_OFF_END_LOCAL", "03:30"),
-        key="SURPLUS_NIGHT_FORCED_OFF_END_LOCAL",
     )
     daytime_surplus_margin_kw = _parse_non_negative_float(
         values.get("DAYTIME_SURPLUS_MARGIN_KW", "0.5"),
@@ -239,11 +224,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         raise ValueError(
             "FORECAST_LIBERAL_SUNSHINE_HOURS_MAX must be greater than or equal to "
             "FORECAST_LIBERAL_SUNSHINE_HOURS_MIN."
-        )
-    if surplus_night_min_turn_on_margin_soc_percent > surplus_night_turn_on_margin_soc_percent:
-        raise ValueError(
-            "SURPLUS_NIGHT_MIN_TURN_ON_MARGIN_SOC_PERCENT must be less than or equal to "
-            "SURPLUS_NIGHT_TURN_ON_MARGIN_SOC_PERCENT."
         )
 
     return Settings(
@@ -295,9 +275,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         },
         surplus_night_base_load_kw=surplus_night_base_load_kw,
         surplus_night_turn_on_margin_soc_percent=surplus_night_turn_on_margin_soc_percent,
-        surplus_night_min_turn_on_margin_soc_percent=(
-            surplus_night_min_turn_on_margin_soc_percent
-        ),
         surplus_night_next_day_sunshine_min=surplus_night_next_day_sunshine_min,
         surplus_night_morning_base_load_kw=surplus_night_morning_base_load_kw,
         surplus_night_morning_start_local=surplus_night_morning_start_local,
@@ -306,8 +283,6 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         surplus_night_generator_margin_soc_percent=surplus_night_generator_margin_soc_percent,
         surplus_night_pump_load_kw=surplus_night_pump_load_kw,
         surplus_night_min_run_hours=surplus_night_min_run_hours,
-        surplus_night_forced_off_start_local=surplus_night_forced_off_start_local,
-        surplus_night_forced_off_end_local=surplus_night_forced_off_end_local,
         daytime_surplus_turn_on_enabled=values.get(
             "DAYTIME_SURPLUS_TURN_ON_ENABLED", "true"
         ).lower() in {"1", "true", "yes", "on"},

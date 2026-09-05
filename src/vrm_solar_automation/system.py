@@ -161,14 +161,9 @@ class PumpControlSystem:
         self._surplus_night_turn_on_margin_soc_percent = (
             settings.surplus_night_turn_on_margin_soc_percent
         )
-        self._surplus_night_min_turn_on_margin_soc_percent = (
-            settings.surplus_night_min_turn_on_margin_soc_percent
-        )
         self._surplus_night_next_day_sunshine_min = settings.surplus_night_next_day_sunshine_min
         self._surplus_night_pump_load_kw = settings.surplus_night_pump_load_kw
         self._surplus_night_min_run_hours = settings.surplus_night_min_run_hours
-        self._forced_off_start_minutes = _hhmm_to_minutes(settings.surplus_night_forced_off_start_local)
-        self._forced_off_end_minutes = _hhmm_to_minutes(settings.surplus_night_forced_off_end_local)
         self._battery_capacity_kwh = settings.battery_capacity_kwh
         self._battery_hard_min_soc_percent = settings.battery_hard_min_soc_percent
         self._forecast_liberal_sunshine_hours_min = settings.forecast_liberal_sunshine_hours_min
@@ -1000,11 +995,7 @@ class PumpControlSystem:
     ) -> PumpDecision:
         battery_soc = power.battery_soc_percent
         required_soc = self._required_night_soc_percent(local_now=local_now, weather=weather)
-        forced_off_active = self._is_within_forced_off_window(local_now=local_now)
         pump_reserve = self._pump_start_reserve_soc_percent(
-            local_now=local_now, weather=weather
-        )
-        window_reserve = self._forced_off_window_reserve_soc_percent(
             local_now=local_now, weather=weather
         )
         crossover_minutes, crossover_source = self._solar_crossover_minutes(
@@ -1021,46 +1012,20 @@ class PumpControlSystem:
             liberal_sunshine_hours_min=self._forecast_liberal_sunshine_hours_min,
             liberal_sunshine_hours_max=self._forecast_liberal_sunshine_hours_max,
         )
-        turn_on_threshold = None
-        turn_off_threshold = None
-        if liberal_factor is not None:
-            # Cut off exactly at the base-load reserve so the battery lands on the night floor
-            # at solar crossover; because that reserve no longer decays toward the floor as
-            # dawn approaches, the pump can no longer be run down into the morning. Starting
-            # additionally carries the compressor run it commits to, so a start is dearer than
-            # continuing rather than the other way round.
-            # Inside the forced-off window both thresholds additionally carry the pump's
-            # draw for the rest of the window, so it may only run on genuine excess SOC.
-            # The start reserve and the window reserve both cover the same pump over
-            # overlapping stretches, so the larger absorbs the smaller rather than stacking.
-            turn_off_threshold = required_soc + window_reserve
-            turn_on_threshold = (
-                required_soc
-                + max(pump_reserve, window_reserve)
-                + linear_interpolate(
-                    self._surplus_night_turn_on_margin_soc_percent,
-                    self._surplus_night_min_turn_on_margin_soc_percent,
-                    liberal_factor,
-                )
-            )
-        blocked_subject = (
-            f"The {self._forced_off_window_label()} forced-off window"
-            if forced_off_active
-            else "Reserve-aware night control"
+        # One rule: run until the battery holds exactly what base load needs to reach solar
+        # crossover on the night floor, then stop. Nothing else limits the run, because
+        # nothing else has to -- the reserve already accounts for every hour left. A start
+        # additionally carries the compressor run it commits to, since that draw happens
+        # whatever SOC does next, plus a small margin so a start is worth making.
+        turn_off_threshold = required_soc
+        turn_on_threshold = (
+            required_soc + pump_reserve + self._surplus_night_turn_on_margin_soc_percent
         )
-        mode_phrase = (
-            f" through the {self._forced_off_window_label()} forced-off window"
-            if forced_off_active
-            else ""
-        )
+        blocked_subject = "Reserve-aware night control"
+        mode_phrase = ""
         reserve_clause = (
             f" (including {pump_reserve:.1f}% for the compressor run a start commits to)"
         )
-        if forced_off_active:
-            reserve_clause = (
-                f" (including {max(pump_reserve, window_reserve):.1f}% covering the pump's own draw"
-                f" for the rest of the window)"
-            )
 
         if battery_soc is None:
             return self._night_decision(
@@ -1071,11 +1036,9 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
-                forced_off_window_active=forced_off_active,
                 pump_reserve_soc_percent=pump_reserve,
                 solar_crossover_local=crossover_local,
                 solar_crossover_source=crossover_source,
-                forced_off_reserve_soc_percent=window_reserve,
                 reason="Battery SOC is unavailable, so reserve-aware night control fails safe to off.",
             )
 
@@ -1088,11 +1051,9 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=None,
                 effective_turn_off_soc_percent=None,
                 forecast_liberal_factor=None,
-                forced_off_window_active=forced_off_active,
                 pump_reserve_soc_percent=pump_reserve,
                 solar_crossover_local=crossover_local,
                 solar_crossover_source=crossover_source,
-                forced_off_reserve_soc_percent=window_reserve,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine-hours forecast is unavailable, so "
                     "reserve-aware night control keeps the pump off."
@@ -1108,11 +1069,9 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
-                forced_off_window_active=forced_off_active,
                 pump_reserve_soc_percent=pump_reserve,
                 solar_crossover_local=crossover_local,
                 solar_crossover_source=crossover_source,
-                forced_off_reserve_soc_percent=window_reserve,
                 reason=(
                     f"{reference_label.capitalize()}'s sunshine forecast is {reference_sunshine:.1f} hours, "
                     f"below the {self._surplus_night_next_day_sunshine_min:.1f}-hour surplus-night minimum, "
@@ -1130,12 +1089,10 @@ class PumpControlSystem:
                     effective_turn_on_soc_percent=turn_on_threshold,
                     effective_turn_off_soc_percent=turn_off_threshold,
                     forecast_liberal_factor=liberal_factor,
-                    forced_off_window_active=forced_off_active,
-                    pump_reserve_soc_percent=pump_reserve,
+                        pump_reserve_soc_percent=pump_reserve,
                     solar_crossover_local=crossover_local,
                     solar_crossover_source=crossover_source,
-                    forced_off_reserve_soc_percent=window_reserve,
-                    reason=(
+                        reason=(
                         f"{blocked_subject} needs at least {turn_off_threshold:.1f}% SOC to keep "
                         f"running, and battery SOC is {battery_soc:.1f}%, so the pump turns off."
                     ),
@@ -1148,11 +1105,9 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
-                forced_off_window_active=forced_off_active,
                 pump_reserve_soc_percent=pump_reserve,
                 solar_crossover_local=crossover_local,
                 solar_crossover_source=crossover_source,
-                forced_off_reserve_soc_percent=window_reserve,
                 reason=(
                     f"Reserve-aware night control stays on{mode_phrase} because {reference_label}'s "
                     f"sunshine forecast is {reference_sunshine:.1f} hours and battery SOC is "
@@ -1170,11 +1125,9 @@ class PumpControlSystem:
                 effective_turn_on_soc_percent=turn_on_threshold,
                 effective_turn_off_soc_percent=turn_off_threshold,
                 forecast_liberal_factor=liberal_factor,
-                forced_off_window_active=forced_off_active,
                 pump_reserve_soc_percent=pump_reserve,
                 solar_crossover_local=crossover_local,
                 solar_crossover_source=crossover_source,
-                forced_off_reserve_soc_percent=window_reserve,
                 reason=(
                     f"{blocked_subject} needs at least {turn_on_threshold:.1f}% SOC to turn on"
                     f"{reserve_clause}, and battery SOC is {battery_soc:.1f}%, so the pump stays off."
@@ -1189,11 +1142,9 @@ class PumpControlSystem:
             effective_turn_on_soc_percent=turn_on_threshold,
             effective_turn_off_soc_percent=turn_off_threshold,
             forecast_liberal_factor=liberal_factor,
-            forced_off_window_active=forced_off_active,
             pump_reserve_soc_percent=pump_reserve,
             solar_crossover_local=crossover_local,
             solar_crossover_source=crossover_source,
-            forced_off_reserve_soc_percent=window_reserve,
             reason=(
                 f"Reserve-aware night control can run{mode_phrase} because {reference_label}'s sunshine "
                 f"forecast is {reference_sunshine:.1f} hours and battery SOC is {battery_soc:.1f}%, "
@@ -1212,11 +1163,9 @@ class PumpControlSystem:
         effective_turn_off_soc_percent: float | None,
         forecast_liberal_factor: float | None,
         reason: str,
-        forced_off_window_active: bool = False,
         pump_reserve_soc_percent: float | None = None,
         solar_crossover_local: str | None = None,
         solar_crossover_source: str | None = None,
-        forced_off_reserve_soc_percent: float | None = None,
     ) -> PumpDecision:
         return PumpDecision(
             should_turn_on=target_on,
@@ -1228,8 +1177,6 @@ class PumpControlSystem:
             night_required_soc_percent=required_soc,
             night_reference_sunshine_hours=reference_sunshine,
             night_surplus_mode_active=True,
-            night_forced_off_window_active=forced_off_window_active,
-            night_forced_off_reserve_soc_percent=forced_off_reserve_soc_percent,
             night_pump_reserve_soc_percent=pump_reserve_soc_percent,
             night_solar_crossover_local=solar_crossover_local,
             night_solar_crossover_source=solar_crossover_source,
@@ -1339,26 +1286,6 @@ class PumpControlSystem:
         )
         return ((hours * self._surplus_night_pump_load_kw) / self._battery_capacity_kwh) * 100.0
 
-    def _forced_off_window_reserve_soc_percent(
-        self, *, local_now: datetime, weather: WeatherSnapshot | None = None
-    ) -> float:
-        """SOC the pump must leave spare to run out the forced-off window, in percent.
-
-        The window exists because a late-night start lands the battery on the floor before
-        any sun can answer for it. Raising both thresholds by the pump's draw for the rest
-        of the window — rather than blocking outright — keeps the original intent: inside
-        the window the pump runs only on genuine excess SOC. Zero outside the window, and
-        capped at the time left to crossover so it cannot outlast the night it is budgeting.
-        """
-        if not self._is_within_forced_off_window(local_now=local_now):
-            return 0.0
-        window_end_at = _next_local_time(local_now, self._forced_off_end_minutes)
-        hours = min(
-            _hours_between(local_now, window_end_at),
-            self._hours_until_crossover(local_now=local_now, weather=weather),
-        )
-        return ((hours * self._surplus_night_pump_load_kw) / self._battery_capacity_kwh) * 100.0
-
     def _hours_until_crossover(
         self, *, local_now: datetime, weather: WeatherSnapshot | None = None
     ) -> float:
@@ -1374,22 +1301,6 @@ class PumpControlSystem:
             return None
         minutes, _ = self._solar_crossover_minutes(weather=weather, local_now=local_now)
         return _next_local_time(local_now, minutes)
-
-    def _is_within_forced_off_window(self, *, local_now: datetime) -> bool:
-        start = self._forced_off_start_minutes
-        end = self._forced_off_end_minutes
-        if start == end:
-            return False
-        current_minutes = (local_now.hour * 60) + local_now.minute
-        if start < end:
-            return start <= current_minutes < end
-        return current_minutes >= start or current_minutes < end
-
-    def _forced_off_window_label(self) -> str:
-        return (
-            f"{self._forced_off_start_minutes // 60:02d}:{self._forced_off_start_minutes % 60:02d}"
-            f"–{self._forced_off_end_minutes // 60:02d}:{self._forced_off_end_minutes % 60:02d}"
-        )
 
     def _build_payload(
         self,
@@ -1418,14 +1329,10 @@ class PumpControlSystem:
             "night_required_soc_percent": decision.night_required_soc_percent,
             "night_reference_sunshine_hours": decision.night_reference_sunshine_hours,
             "night_surplus_mode_active": decision.night_surplus_mode_active,
-            "night_forced_off_window_active": decision.night_forced_off_window_active,
             "night_pump_reserve_soc_percent": decision.night_pump_reserve_soc_percent,
             "daytime_surplus_override_active": decision.daytime_surplus_override_active,
             "daytime_projected_surplus_kw": decision.daytime_projected_surplus_kw,
             "generator_start_blocked": decision.generator_start_blocked,
-            "night_forced_off_reserve_soc_percent": (
-                decision.night_forced_off_reserve_soc_percent
-            ),
             "night_solar_crossover_local": decision.night_solar_crossover_local,
             "night_solar_crossover_source": decision.night_solar_crossover_source,
             "effective_turn_on_soc_percent": decision.effective_turn_on_soc_percent,

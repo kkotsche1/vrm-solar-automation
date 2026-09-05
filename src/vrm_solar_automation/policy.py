@@ -120,7 +120,6 @@ class PumpDecision:
     night_required_soc_percent: float | None = None
     night_reference_sunshine_hours: float | None = None
     night_surplus_mode_active: bool = False
-    night_forced_off_window_active: bool = False
     night_pump_reserve_soc_percent: float | None = None
     night_solar_crossover_local: str | None = None
     night_solar_crossover_source: str | None = None
@@ -129,7 +128,6 @@ class PumpDecision:
     forecast_liberal_factor: float | None = None
     daytime_surplus_override_active: bool = False
     daytime_projected_surplus_kw: float | None = None
-    night_forced_off_reserve_soc_percent: float | None = None
     generator_start_blocked: bool = False
 
     def to_dict(self) -> dict[str, object]:
@@ -143,7 +141,6 @@ class PumpDecision:
             "night_required_soc_percent": self.night_required_soc_percent,
             "night_reference_sunshine_hours": self.night_reference_sunshine_hours,
             "night_surplus_mode_active": self.night_surplus_mode_active,
-            "night_forced_off_window_active": self.night_forced_off_window_active,
             "night_pump_reserve_soc_percent": self.night_pump_reserve_soc_percent,
             "night_solar_crossover_local": self.night_solar_crossover_local,
             "night_solar_crossover_source": self.night_solar_crossover_source,
@@ -152,7 +149,6 @@ class PumpDecision:
             "forecast_liberal_factor": self.forecast_liberal_factor,
             "daytime_surplus_override_active": self.daytime_surplus_override_active,
             "daytime_projected_surplus_kw": self.daytime_projected_surplus_kw,
-            "night_forced_off_reserve_soc_percent": self.night_forced_off_reserve_soc_percent,
             "generator_start_blocked": self.generator_start_blocked,
         }
 
